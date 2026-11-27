@@ -200,10 +200,17 @@ end
 -- Performance: ONE shared InputChanged/InputEnded connection (made in Library:_Init)
 -- instead of two per slider / color picker, so mouse movement stays cheap.
 local activeDrag = nil
+local activeScroll = nil
 local function Dragger(handle, onMove)
 	handle.InputBegan:Connect(function(i)
 		if isPress(i) then
 			activeDrag = onMove
+			-- touch: stop the page from scrolling while a slider / picker is being dragged
+			local sf = handle:FindFirstAncestorOfClass("ScrollingFrame")
+			if sf then
+				sf.ScrollingEnabled = false
+				activeScroll = sf
+			end
 			onMove(i.Position)
 		end
 	end)
@@ -317,8 +324,23 @@ function Library:_Init()
 	connect(UIS.InputEnded, function(i)
 		if activeDrag and isPress(i) then
 			activeDrag = nil
+			if activeScroll then
+				activeScroll.ScrollingEnabled = true
+				activeScroll = nil
+			end
 		end
 	end)
+
+	-- popups (dropdowns, color pickers) live in their own layer so they can be scaled with the window
+	self.Touch = UIS.TouchEnabled and not UIS.KeyboardEnabled
+	self.Scale = 1
+	self.PopLayer = New("Frame", {
+		BackgroundTransparency = 1,
+		Size = UDim2.new(),
+		ZIndex = 100,
+		Parent = self.Gui,
+	})
+	self.PopScale = New("UIScale", { Parent = self.PopLayer })
 
 	-- one stats ticker for the whole UI (watermark, live stats, auto booster all read from it)
 	self._stats = {}
@@ -599,8 +621,9 @@ function Library:Unload()
 		self.Gui:Destroy()
 	end
 	self.Gui, self.Catcher, self._wm, self._wmLabel, self._popup = nil, nil, nil, nil, nil
+	self.PopLayer, self.PopScale = nil, nil
 	self._keylist, self._kbs, self._stats = nil, {}, {}
-	activeDrag = nil
+	activeDrag, activeScroll = nil, nil
 	table.clear(self.Flags)
 	table.clear(self.Options)
 end
@@ -626,7 +649,7 @@ local function AddColorPicker(parent, flag, o, rightOffset)
 		Parent = swOuter,
 	})
 
-	local pop, inner = Panel(Library.Gui, Vector2.new(164, 132))
+	local pop, inner = Panel(Library.PopLayer, Vector2.new(164, 132))
 	pop.Visible = false
 	pop.ZIndex = 100
 
@@ -706,7 +729,11 @@ local function AddColorPicker(parent, flag, o, rightOffset)
 
 	sw.MouseButton1Click:Connect(function()
 		local ap = sw.AbsolutePosition
-		pop.Position = UDim2.fromOffset(math.max(ap.X - 142, 4), ap.Y + 14)
+		local s = Library.Scale
+		local gs = Library.Gui.AbsoluteSize
+		local x = math.clamp(ap.X - 142 * s, 4, math.max(4, gs.X - 168 * s))
+		local y = math.clamp(ap.Y + 14 * s, 4, math.max(4, gs.Y - 136 * s))
+		pop.Position = UDim2.fromOffset(x / s, y / s)
 		OpenPopup(pop)
 	end)
 	return P
@@ -724,10 +751,30 @@ function Library:CreateWindow(opts)
 		Name = "Window",
 		BackgroundColor3 = THEME.Outer,
 		Size = UDim2.fromOffset(size.X, size.Y),
-		Position = UDim2.new(0.5, -size.X / 2, 0.5, -size.Y / 2),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
 		ZIndex = 1,
 		Parent = self.Gui,
 	})
+	-- MOBILE / SMALL SCREENS: scale the whole window (and its popups) down to fit the viewport
+	local winScale = New("UIScale", { Parent = root })
+	local function fit()
+		local cam = workspace.CurrentCamera
+		local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+		local s = math.clamp(math.min((vp.X - 16) / size.X, (vp.Y - 16) / size.Y), 0.4, 1)
+		Library.Scale = s
+		winScale.Scale = s
+		if Library.PopScale then
+			Library.PopScale.Scale = s
+		end
+	end
+	fit()
+	do
+		local cam = workspace.CurrentCamera
+		if cam then
+			connect(cam:GetPropertyChangedSignal("ViewportSize"), fit)
+		end
+	end
 	local function layer(color, inset, z)
 		return New("Frame", {
 			BackgroundColor3 = color,
@@ -802,6 +849,28 @@ function Library:CreateWindow(opts)
 			Window:Toggle()
 		end
 	end)
+
+	-- touch devices have no menu key: show a small button that opens / closes the menu
+	if UIS.TouchEnabled then
+		local tb = New("TextButton", {
+			Text = "LS",
+			TextXAlignment = CENTER,
+			TextColor3 = THEME.Accent,
+			TextSize = 15,
+			BackgroundColor3 = THEME.Background,
+			BackgroundTransparency = 0.1,
+			Position = UDim2.new(0, 12, 0.3, 0),
+			Size = UDim2.fromOffset(44, 44),
+			ZIndex = 130,
+			Parent = self.Gui,
+		}, {
+			New("UIStroke", { Color = THEME.Accent, Thickness = 1 }),
+			New("UICorner", { CornerRadius = UDim.new(0, 6) }),
+		})
+		tb.MouseButton1Click:Connect(function()
+			Window:Toggle()
+		end)
+	end
 
 	function Window:AddTab(name)
 		local Tab = { Name = name, _n = 0 }
@@ -925,7 +994,7 @@ function Library:CreateWindow(opts)
 				order += 1
 				return New("Frame", {
 					BackgroundTransparency = 1,
-					Size = UDim2.new(1, 0, 0, height),
+					Size = UDim2.new(1, 0, 0, height + (Library.Touch and 8 or 0)), -- bigger tap targets on touch
 					LayoutOrder = order,
 					Parent = content,
 				})
@@ -1047,7 +1116,14 @@ function Library:CreateWindow(opts)
 					render()
 					Fire(self)
 				end
-				Dragger(bar, function(pos)
+				-- the hit area covers the whole lower part of the row, not just the thin bar (easier on touch)
+				local hit = New("TextButton", {
+					Position = UDim2.fromOffset(0, 12),
+					Size = UDim2.new(1, 0, 1, -12),
+					ZIndex = 5,
+					Parent = r,
+				})
+				Dragger(hit, function(pos)
 					local t = math.clamp((pos.X - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1)
 					S:Set(min + (max - min) * t)
 				end)
@@ -1104,7 +1180,7 @@ function Library:CreateWindow(opts)
 				btn.MouseEnter:Connect(function() btn.BackgroundColor3 = THEME.ControlHover end)
 				btn.MouseLeave:Connect(function() btn.BackgroundColor3 = THEME.Control end)
 
-				local pop, popInner = Panel(Library.Gui, Vector2.new(100, 24))
+				local pop, popInner = Panel(Library.PopLayer, Vector2.new(100, 24))
 				pop.Visible = false
 				pop.ZIndex = 100
 				-- long lists (configs, skyboxes, shaders) scroll instead of running off screen
@@ -1148,7 +1224,7 @@ function Library:CreateWindow(opts)
 						local b = New("TextButton", {
 							Text = name,
 							BackgroundColor3 = THEME.Control,
-							Size = UDim2.new(1, 0, 0, 18),
+							Size = UDim2.new(1, 0, 0, Library.Touch and 24 or 18),
 							LayoutOrder = i,
 							Parent = popIn,
 						}, { Pad(7, 0, 0, 0) })
@@ -1194,8 +1270,14 @@ function Library:CreateWindow(opts)
 				end
 
 				btn.MouseButton1Click:Connect(function()
-					pop.Size = UDim2.fromOffset(box.AbsoluteSize.X, math.min(#D.Values, 10) * 18 + 4)
-					pop.Position = UDim2.fromOffset(box.AbsolutePosition.X, box.AbsolutePosition.Y + box.AbsoluteSize.Y - 1)
+					local s = Library.Scale
+					local h = math.min(#D.Values, 10) * (Library.Touch and 24 or 18) + 4
+					pop.Size = UDim2.fromOffset(box.AbsoluteSize.X / s, h)
+					local x, y = box.AbsolutePosition.X, box.AbsolutePosition.Y + box.AbsoluteSize.Y - 1
+					if y + h * s > Library.Gui.AbsoluteSize.Y then
+						y = box.AbsolutePosition.Y - h * s + 1 -- not enough room below: open upward
+					end
+					pop.Position = UDim2.fromOffset(x / s, math.max(y, 0) / s)
 					OpenPopup(pop)
 				end)
 				return D
@@ -1412,28 +1494,35 @@ local function weak()
 end
 
 local function newTracker()
-	return { props = weak(), parents = weak(), conns = {} }
+	return { props = weak(), parents = weak(), conns = {}, n = 0 }
+end
+
+-- PERFORMANCE: no closures are created per call (pcall gets a shared function + arguments),
+-- originals are stored raw (not boxed in a table), and nothing is touched when the value is
+-- already what we want (so already-flat / already-off instances cost almost nothing).
+local function getProp(inst, prop)
+	return inst[prop]
+end
+local function setProp(inst, prop, value)
+	inst[prop] = value
 end
 
 -- set a property but remember the original so restore() can undo it
 local function track(tr, inst, prop, value)
-	local ok, cur = pcall(function()
-		return inst[prop]
-	end)
-	if not ok then
+	local ok, cur = pcall(getProp, inst, prop)
+	if not ok or cur == value then
 		return
 	end
 	local rec = tr.props[inst]
 	if not rec then
 		rec = {}
 		tr.props[inst] = rec
+		tr.n += 1
 	end
 	if rec[prop] == nil then
-		rec[prop] = { cur }
+		rec[prop] = cur -- (false is a valid original, so only nil means "not recorded")
 	end
-	pcall(function()
-		inst[prop] = value
-	end)
+	pcall(setProp, inst, prop, value)
 end
 
 -- remove an instance from the game but remember where it was
@@ -1441,30 +1530,58 @@ local function detach(tr, inst)
 	local p = inst.Parent
 	if p then
 		tr.parents[inst] = p
+		tr.n += 1
 		inst.Parent = nil
 	end
 end
 
+local function restoreEntries(props, parents)
+	local t0, count = os.clock(), 0
+	for inst, parent in pairs(parents) do
+		if parent == game or parent:IsDescendantOf(game) then
+			pcall(setProp, inst, "Parent", parent)
+		end
+		count += 1
+		if count % 32 == 0 and os.clock() - t0 > 0.002 then
+			task.wait()
+			t0 = os.clock()
+		end
+	end
+	for inst, rec in pairs(props) do
+		for prop, original in pairs(rec) do
+			pcall(setProp, inst, prop, original)
+		end
+		count += 1
+		if count % 32 == 0 and os.clock() - t0 > 0.002 then
+			task.wait()
+			t0 = os.clock()
+		end
+	end
+end
+
+-- big trackers (thousands of parts) are restored over several frames so turning a
+-- feature off can't freeze the game either
 local function restore(tr)
 	for _, c in ipairs(tr.conns) do
 		c:Disconnect()
 	end
 	tr.conns = {}
-	for inst, parent in pairs(tr.parents) do
-		if parent == game or parent:IsDescendantOf(game) then
-			pcall(function()
-				inst.Parent = parent
-			end)
+	local props, parents, n = tr.props, tr.parents, tr.n
+	tr.props, tr.parents, tr.n = weak(), weak(), 0
+	if n > 400 then
+		task.spawn(restoreEntries, props, parents)
+	else
+		for inst, parent in pairs(parents) do
+			if parent == game or parent:IsDescendantOf(game) then
+				pcall(setProp, inst, "Parent", parent)
+			end
+		end
+		for inst, rec in pairs(props) do
+			for prop, original in pairs(rec) do
+				pcall(setProp, inst, prop, original)
+			end
 		end
 	end
-	for inst, rec in pairs(tr.props) do
-		for prop, wrapped in pairs(rec) do
-			pcall(function()
-				inst[prop] = wrapped[1]
-			end)
-		end
-	end
-	tr.props, tr.parents = weak(), weak()
 end
 
 local function isOurs(d)
@@ -1478,47 +1595,118 @@ end
 ---------------------------------------------------------------- feature factory
 -- def.Global(tr)   : runs once when enabled
 -- def.Inst(tr, d)  : runs for every existing + newly added workspace descendant
--- PERFORMANCE: every Inst feature shares ONE workspace.DescendantAdded connection and ONE
--- chunked scan of the workspace (instead of one connection + one full scan per feature).
+-- PERFORMANCE / STABILITY:
+--  * every Inst feature shares ONE workspace.DescendantAdded connection and ONE scan of the workspace
+--  * ALL work (initial scan + newly added instances) runs through a single Heartbeat pump with a
+--    per-frame TIME BUDGET (Graphics.Budget, default 2.5 ms). The pump shrinks its budget further when
+--    the frame rate is already low, so enabling many features at once (max FPS preset) stays smooth
+--    instead of freezing the game while thousands of properties change in one frame.
+Graphics.Budget = 0.0025
+
 local activeInst = {} -- features currently enabled that have an Inst handler
 local activeCount = 0
 local dispatchConn = nil
-local scanQueue = {} -- features waiting for their first scan
-local scanning = false
+local pumpConn = nil
+local jobs = {} -- { feats = {...}, list = {...}, i = next index }
+local incoming, inHead, inTail = {}, 1, 0 -- queue of newly added instances
+local pendingFeats, flushScheduled = {}, false
 
-local function runScan()
-	if scanning then
-		return
+local function pump(dt)
+	local t0 = os.clock()
+	local budget = Graphics.Budget
+	if dt > 0.022 then
+		budget = math.min(budget, 0.001) -- already below ~45 fps: back off
 	end
-	scanning = true
-	task.spawn(function()
-		while #scanQueue > 0 do
-			local batch = scanQueue
-			scanQueue = {}
-			local list = workspace:GetDescendants()
-			for i, d in ipairs(list) do
-				for _, F in ipairs(batch) do
-					if F.Enabled and F.def.Inst then
-						pcall(F.def.Inst, F.tr, d)
-					end
-				end
-				if i % 600 == 0 then
-					task.wait()
-				end
+	-- 1) newly added instances first, so new objects don't pop in unboosted
+	while inHead <= inTail do
+		local d = incoming[inHead]
+		incoming[inHead] = nil
+		inHead += 1
+		if d.Parent then
+			for f in pairs(activeInst) do
+				pcall(f.def.Inst, f.tr, d)
 			end
 		end
-		scanning = false
-	end)
+		if inHead % 16 == 0 and os.clock() - t0 > budget then
+			return
+		end
+	end
+	inHead, inTail = 1, 0
+	-- 2) initial scans of the existing workspace
+	local job = jobs[1]
+	if not job then
+		if pumpConn and activeCount <= 0 then
+			pumpConn:Disconnect()
+			pumpConn = nil
+		end
+		return
+	end
+	local list, feats = job.list, job.feats
+	local nf, n, i = #feats, #list, job.i
+	while i <= n do
+		local d = list[i]
+		i += 1
+		for k = 1, nf do
+			local F = feats[k]
+			if F.Enabled then
+				pcall(F.def.Inst, F.tr, d)
+			end
+		end
+		if i % 16 == 0 and os.clock() - t0 > budget then
+			break
+		end
+	end
+	job.i = i
+	if i > n then
+		table.remove(jobs, 1)
+	end
+end
+
+local function ensurePump()
+	if not pumpConn then
+		pumpConn = RunService.Heartbeat:Connect(pump)
+	end
+end
+
+local function flushPending()
+	flushScheduled = false
+	local live = {}
+	for _, F in ipairs(pendingFeats) do
+		if F.Enabled then
+			live[#live + 1] = F
+		end
+	end
+	pendingFeats = {}
+	if #live > 0 then
+		jobs[#jobs + 1] = { feats = live, list = workspace:GetDescendants(), i = 1 }
+		ensurePump()
+	end
+end
+
+local function stopPump()
+	if pumpConn then
+		pumpConn:Disconnect()
+		pumpConn = nil
+	end
+	if dispatchConn then
+		dispatchConn:Disconnect()
+		dispatchConn = nil
+	end
+	jobs, incoming, inHead, inTail, pendingFeats = {}, {}, 1, 0, {}
+	activeInst, activeCount = {}, 0
 end
 
 local function addActive(F)
+	if activeInst[F] then
+		return
+	end
 	activeInst[F] = true
 	activeCount += 1
 	if not dispatchConn then
 		dispatchConn = workspace.DescendantAdded:Connect(function(d)
-			for f in pairs(activeInst) do
-				pcall(f.def.Inst, f.tr, d)
-			end
+			inTail += 1
+			incoming[inTail] = d -- just queue it; the pump does the work within its budget
+			ensurePump()
 		end)
 	end
 end
@@ -1548,8 +1736,11 @@ local function Feature(def)
 		end
 		if def.Inst then
 			addActive(self)
-			table.insert(scanQueue, self)
-			runScan()
+			pendingFeats[#pendingFeats + 1] = self
+			if not flushScheduled then
+				flushScheduled = true
+				task.defer(flushPending) -- batch everything enabled this frame into ONE scan
+			end
 		end
 	end
 
@@ -2453,10 +2644,34 @@ end
 ---------------------------------------------------------------- character visuals (your own character only)
 local LocalPlayer = Players.LocalPlayer
 
+-- aura styles: particle styles use a ParticleEmitter, styles with a Kind are built from glowing beads
+local AURA_SOFT = "rbxasset://textures/particles/smoke_main.dds"
+local AURA_SPARK = "rbxasset://textures/particles/sparkles_main.dds"
+local AURAS = {
+	["Orbs"] = { Tex = AURA_SPARK, Rate = 25, Life = NumberRange.new(0.6, 1.2), Speed = NumberRange.new(1, 3), Spread = 180, S0 = 0.35, S1 = 0, A0 = 0.2, Glow = 1 },
+	["Flames"] = { Tex = AURA_SOFT, Rate = 70, Life = NumberRange.new(0.5, 0.9), Speed = NumberRange.new(3, 6), Spread = 22, S0 = 1.8, S1 = 0.2, A0 = 0.25, Glow = 1, Accel = Vector3.new(0, 7, 0) },
+	["Electric"] = { Tex = AURA_SPARK, Rate = 45, Life = NumberRange.new(0.12, 0.28), Speed = NumberRange.new(8, 14), Spread = 180, S0 = 0.55, S1 = 0.1, A0 = 0, Glow = 1, Rot = 400 },
+	["Smoke"] = { Tex = AURA_SOFT, Rate = 30, Life = NumberRange.new(1.5, 2.5), Speed = NumberRange.new(1, 2), Spread = 60, S0 = 1.5, S1 = 4, A0 = 0.55, Glow = 0, Accel = Vector3.new(0, 2, 0), Rot = 40 },
+	["Sparkles"] = { Tex = AURA_SPARK, Rate = 35, Life = NumberRange.new(1, 1.8), Speed = NumberRange.new(1, 3), Spread = 180, S0 = 0.45, S1 = 0, A0 = 0, Glow = 1, Rot = 120 },
+	["Galaxy"] = { Tex = AURA_SPARK, Rate = 70, Life = NumberRange.new(2, 3), Speed = NumberRange.new(0.5, 1.5), Spread = 180, S0 = 0.28, S1 = 0.05, A0 = 0, Glow = 1, Rot = 60, Drag = 1 },
+	["Snowfall"] = { Tex = AURA_SOFT, Rate = 25, Life = NumberRange.new(2, 3), Speed = NumberRange.new(0.3, 1), Spread = 180, S0 = 0.3, S1 = 0.25, A0 = 0.1, Glow = 0.2, Accel = Vector3.new(0, -3, 0) },
+	["Void"] = { Tex = AURA_SOFT, Rate = 35, Life = NumberRange.new(1, 1.6), Speed = NumberRange.new(0, 0.6), Spread = 180, S0 = 2.2, S1 = 0.4, A0 = 0.25, Glow = 0, Rot = 80 },
+	["Embers"] = { Tex = AURA_SPARK, Rate = 40, Life = NumberRange.new(1.5, 2.5), Speed = NumberRange.new(2, 5), Spread = 40, S0 = 0.32, S1 = 0, A0 = 0, Glow = 1, Accel = Vector3.new(0, 5, 0) },
+	["Halo"] = { Kind = "halo", Count = 24, Bead = 0.16 },
+	["Orbiting Orbs"] = { Kind = "orbit", Count = 5, Bead = 0.75 },
+	["Spiral"] = { Kind = "spiral", Count = 18, Bead = 0.3 },
+	["Ground Ring"] = { Kind = "ground", Count = 30, Bead = 0.22 },
+}
+local AURA_ORDER = {
+	"Orbs", "Flames", "Electric", "Smoke", "Sparkles", "Galaxy", "Snowfall", "Void", "Embers",
+	"Halo", "Orbiting Orbs", "Spiral", "Ground Ring",
+}
+
 local Character = {
 	tr = newTracker(),
 	created = {},
 	parts = {},
+	AuraStyles = AURA_ORDER,
 	Materials = {
 		"Neon", "ForceField", "Glass", "SmoothPlastic", "Plastic", "Metal", "DiamondPlate",
 		"Foil", "Ice", "Marble", "Granite", "Slate", "Wood", "Fabric",
@@ -2466,7 +2681,8 @@ local Character = {
 		Rainbow = false, RainbowSpeed = 0.5, Accessories = true, Strip = true,
 		Outline = false, OutlineColor = C(255, 255, 255), FillColor = C(255, 255, 255), FillTransparency = 1,
 		Trail = false, TrailColor = C(0, 255, 255), TrailLifetime = 0.6,
-		Aura = false, AuraColor = C(255, 0, 170),
+		Aura = false, AuraColor = C(255, 0, 170), AuraColor2 = C(120, 60, 255),
+		AuraStyle = "Orbs", AuraIntensity = 1, AuraSize = 1,
 		Glow = false, GlowColor = C(255, 255, 255), GlowRange = 14, GlowBrightness = 2,
 	},
 }
@@ -2544,9 +2760,11 @@ function Character:Refresh()
 	end
 	self.created, self.parts = {}, {}
 	self.hl, self.trail, self.aura, self.light = nil, nil, nil, nil
+	self.anim, self.auraParts = nil, nil
 
 	local char = LocalPlayer.Character
 	if not char then
+		self:_updateLoop()
 		return
 	end
 	local S = self.S
@@ -2590,16 +2808,30 @@ function Character:Refresh()
 			}, hrp)
 		end
 		if S.Aura then
-			self.aura = self:_make("ParticleEmitter", "Aura", {
-				Rate = 25,
-				Lifetime = NumberRange.new(0.6, 1.2),
-				Speed = NumberRange.new(1, 3),
-				SpreadAngle = Vector2.new(180, 180),
-				Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.35), NumberSequenceKeypoint.new(1, 0) }),
-				Transparency = NumberSequence.new(0.2, 1),
-				LightEmission = 1,
-				Color = ColorSequence.new(S.AuraColor),
-			}, hrp)
+			local st = AURAS[S.AuraStyle] or AURAS["Orbs"]
+			if st.Kind then
+				self:_buildAuraParts(st)
+			else
+				local rot = st.Rot or 0
+				self.aura = self:_make("ParticleEmitter", "Aura", {
+					Texture = st.Tex,
+					Rate = st.Rate * S.AuraIntensity,
+					Lifetime = st.Life,
+					Speed = st.Speed,
+					SpreadAngle = Vector2.new(st.Spread, st.Spread),
+					Size = NumberSequence.new({
+						NumberSequenceKeypoint.new(0, st.S0 * S.AuraSize),
+						NumberSequenceKeypoint.new(1, st.S1 * S.AuraSize),
+					}),
+					Transparency = NumberSequence.new(st.A0, 1),
+					LightEmission = st.Glow,
+					Color = ColorSequence.new(S.AuraColor, S.AuraColor2),
+					Acceleration = st.Accel or Vector3.new(),
+					Rotation = NumberRange.new(0, 360),
+					RotSpeed = NumberRange.new(-rot, rot),
+					Drag = st.Drag or 0,
+				}, hrp)
+			end
 		end
 		if S.Glow then
 			self.light = self:_make("PointLight", "Glow", {
@@ -2609,37 +2841,99 @@ function Character:Refresh()
 				Shadows = false,
 			}, hrp)
 		end
+		self.hrp = hrp
+	end
+	self:_updateLoop()
+end
+
+-- bead-based auras (halo / orbiting orbs / spiral / ground ring): small glowing parts that follow you.
+-- They live under the camera, so only you see them.
+function Character:_buildAuraParts(st)
+	local S = self.S
+	local folder = self:_make("Folder", "AuraParts", {}, workspace.CurrentCamera or workspace)
+	local sz = S.AuraSize
+	local n = st.Count
+	local parts = {}
+	for i = 1, n do
+		local p = Instance.new("Part")
+		p.Name = PREFIX .. "AuraBead"
+		p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch, p.CastShadow = true, false, false, false, false
+		p.Material = Enum.Material.Neon
+		p.Shape = Enum.PartType.Ball
+		p.Size = Vector3.new(st.Bead * sz, st.Bead * sz, st.Bead * sz)
+		p.Color = S.AuraColor:Lerp(S.AuraColor2, (i - 1) / math.max(n - 1, 1))
+		p.Parent = folder
+		parts[i] = p
+	end
+	self.auraParts = parts
+	local kind = st.Kind
+	local sin, cos, pi = math.sin, math.cos, math.pi
+	self.anim = function(t, root)
+		local pos = root.Position
+		for i = 1, n do
+			local p = parts[i]
+			if kind == "orbit" then
+				local a = t * 1.8 + i * (2 * pi / n)
+				p.Position = pos + Vector3.new(cos(a) * 3.4 * sz, sin(t * 2 + i) * 0.8, sin(a) * 3.4 * sz)
+			elseif kind == "halo" then
+				local a = i * (2 * pi / n) + t * 0.8
+				p.Position = pos + Vector3.new(cos(a) * 1.15 * sz, 3.3 + sin(t * 2) * 0.12, sin(a) * 1.15 * sz)
+			elseif kind == "spiral" then
+				local a = t * 2.2 + i * 0.75
+				local h = ((i - 1) / math.max(n - 1, 1)) * 6.4 - 3 + sin(t + i) * 0.15
+				local r = (2.1 + sin(i * 0.5 + t) * 0.35) * sz
+				p.Position = pos + Vector3.new(cos(a) * r, h, sin(a) * r)
+			else -- ground ring
+				local a = i * (2 * pi / n) - t * 1.2
+				local r = (2.7 + sin(t * 2) * 0.35) * sz
+				p.Position = pos + Vector3.new(cos(a) * r, -2.85 + sin(t * 4 + i) * 0.12, sin(a) * r)
+			end
+		end
 	end
 end
 
-function Character:_ensureLoop()
-	if self._loop then
-		return
-	end
-	self._loop = RunService.RenderStepped:Connect(function()
-		local S = self.S
-		if not S.Rainbow then
-			return
-		end
-		local c = Color3.fromHSV((os.clock() * S.RainbowSpeed) % 1, 0.85, 1)
-		for _, p in ipairs(self.parts) do
-			if p.Parent then
-				p.Color = c
+-- the render loop only exists while something needs it (rainbow colors or an animated aura)
+function Character:_updateLoop()
+	local need = self.S.Rainbow or self.anim ~= nil
+	if need and not self._loop then
+		self._loop = RunService.RenderStepped:Connect(function()
+			local S = self.S
+			local t = os.clock()
+			local root = self.hrp
+			if self.anim and root and root.Parent then
+				self.anim(t, root)
 			end
-		end
-		if self.hl and self.hl.Parent then
-			self.hl.OutlineColor = c
-		end
-		if self.trail and self.trail.Parent then
-			self.trail.Color = ColorSequence.new(c)
-		end
-		if self.aura and self.aura.Parent then
-			self.aura.Color = ColorSequence.new(c)
-		end
-		if self.light and self.light.Parent then
-			self.light.Color = c
-		end
-	end)
+			if not S.Rainbow then
+				return
+			end
+			local c = Color3.fromHSV((t * S.RainbowSpeed) % 1, 0.85, 1)
+			for _, p in ipairs(self.parts) do
+				if p.Parent then
+					p.Color = c
+				end
+			end
+			if self.auraParts then
+				for _, p in ipairs(self.auraParts) do
+					p.Color = c
+				end
+			end
+			if self.hl and self.hl.Parent then
+				self.hl.OutlineColor = c
+			end
+			if self.trail and self.trail.Parent then
+				self.trail.Color = ColorSequence.new(c)
+			end
+			if self.aura and self.aura.Parent then
+				self.aura.Color = ColorSequence.new(c)
+			end
+			if self.light and self.light.Parent then
+				self.light.Color = c
+			end
+		end)
+	elseif not need and self._loop then
+		self._loop:Disconnect()
+		self._loop = nil
+	end
 end
 
 function Character:Init()
@@ -2652,7 +2946,6 @@ function Character:Init()
 		task.wait(0.5) -- let the appearance load
 		self:Refresh()
 	end)
-	self:_ensureLoop()
 end
 
 -- change a setting; rapid changes (slider drags) are coalesced into one refresh
@@ -3192,6 +3485,7 @@ function Graphics:Destroy()
 			f:Disable()
 		end
 	end
+	stopPump()
 	Shaders:Apply("Off")
 	Sky:Apply("Off (game default)")
 	if self._statsConn then
@@ -3299,6 +3593,13 @@ function Graphics:BuildTabs(Library, Window)
 		Text = "Culling distance", Min = 50, Max = 1500, Default = 300, Increment = 10, Suffix = " studs",
 		Callback = function(v)
 			self_.CullDistance = v
+		end,
+	})
+	g:AddSlider("fps_budget", {
+		Text = "Apply speed (lower = smoother)", Min = 0.5, Max = 10, Default = 2.5, Increment = 0.5, Suffix = " ms",
+		NoConfig = true,
+		Callback = function(v)
+			self_.Budget = v / 1000
 		end,
 	})
 
@@ -3448,9 +3749,14 @@ function Graphics:BuildTabs(Library, Window)
 		Min = 0, Max = 100, Default = 100, Suffix = "%", Increment = 5,
 		Callback = function(v)
 			Shaders.Strength = v / 100
-			if Shaders.Current ~= "Off" then
-				Shaders:Apply(Shaders.Current)
-			end
+			-- debounced: dragging the slider re-applies once it settles, not on every step
+			Shaders._tok = (Shaders._tok or 0) + 1
+			local my = Shaders._tok
+			task.delay(0.12, function()
+				if my == Shaders._tok and Shaders.Current ~= "Off" then
+					Shaders:Apply(Shaders.Current)
+				end
+			end)
 		end,
 	})
 	local tiers = sh:AddGroup("Quality tiers", "Right")
@@ -4464,6 +4770,6 @@ Info:AddLabel("Only changes what YOU see.")
 Info:AddLabel("FPS depends on your PC: the booster")
 Info:AddLabel("removes work, it can't add GPU power.")
 
-Library:SetWatermark("logicsense")
+Library:SetWatermark("logicsensee")
 Library:Notify("Loaded - press RightShift to toggle the menu", 4)
 
