@@ -1,7 +1,8 @@
 --[[
-    Bundle.lua - SkeetUI + Graphics + demo in ONE script (no ModuleScripts needed).
-    Run it with:  loadstring(<this file's source>)()
-    See Loader.lua for the one-liner.
+logicsense is tuff dada 
+ok i gotta stfu ngl
+dc:.breachhhhh  add me in dc to suggest more features to the script (i dont provide cheats so dont fuck around with me asking for aimbot or esp)
+free to skid it
 ]]
 
 local __mods, __cache = {}, {}
@@ -49,13 +50,19 @@ local UIS = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local TextService = game:GetService("TextService")
 local HttpService = game:GetService("HttpService")
+local TweenService = game:GetService("TweenService")
 
 local Library = {
 	Flags = {},
 	Options = {},
 	Font = Enum.Font.Arial, -- closest built-in match to gamesense's Tahoma/Verdana
 	TextSize = 13,
+	FPS = 60,
+	FrameMs = 16.7,
+	MenuVisible = true,
 	_conns = {},
+	_kbs = {},
+	_stats = {},
 }
 
 local THEME = {
@@ -189,23 +196,15 @@ local function isMove(i)
 	return i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch
 end
 
--- calls onMove(position) while the pointer is held on `handle`
+-- calls onMove(position) while the pointer is held on `handle`.
+-- Performance: ONE shared InputChanged/InputEnded connection (made in Library:_Init)
+-- instead of two per slider / color picker, so mouse movement stays cheap.
+local activeDrag = nil
 local function Dragger(handle, onMove)
-	local active = false
 	handle.InputBegan:Connect(function(i)
 		if isPress(i) then
-			active = true
+			activeDrag = onMove
 			onMove(i.Position)
-		end
-	end)
-	connect(UIS.InputChanged, function(i)
-		if active and isMove(i) then
-			onMove(i.Position)
-		end
-	end)
-	connect(UIS.InputEnded, function(i)
-		if isPress(i) then
-			active = false
 		end
 	end)
 end
@@ -265,7 +264,16 @@ local function Fire(obj)
 end
 
 local function Base(flag, o, value, typ)
-	local obj = { Flag = flag, Value = value, Callback = o.Callback, _changed = {}, Type = typ }
+	local obj = {
+		Flag = flag,
+		Value = value,
+		Default = o.Default,
+		Callback = o.Callback,
+		NoConfig = o.NoConfig, -- not saved/loaded in configs (UI-only options)
+		NoReset = o.NoReset, -- not touched when a config resets toggles
+		_changed = {},
+		Type = typ,
+	}
 	function obj:OnChanged(fn)
 		table.insert(self._changed, fn)
 	end
@@ -299,6 +307,34 @@ function Library:_Init()
 	self.Catcher.MouseButton1Click:Connect(ClosePopup)
 	self.Catcher.MouseButton2Click:Connect(ClosePopup)
 
+	-- shared drag dispatcher
+	connect(UIS.InputChanged, function(i)
+		if activeDrag and isMove(i) then
+			activeDrag(i.Position)
+		end
+	end)
+	connect(UIS.InputEnded, function(i)
+		if activeDrag and isPress(i) then
+			activeDrag = nil
+		end
+	end)
+
+	-- one stats ticker for the whole UI (watermark, live stats, auto booster all read from it)
+	self._stats = {}
+	local acc, frames = 0, 0
+	connect(RunService.Heartbeat, function(dt)
+		acc += dt
+		frames += 1
+		if acc >= 0.5 then
+			self.FPS = math.floor(frames / acc + 0.5)
+			self.FrameMs = 1000 * acc / frames
+			acc, frames = 0, 0
+			for _, fn in ipairs(self._stats) do
+				pcall(fn, self.FPS, self.FrameMs)
+			end
+		end
+	end)
+
 	self.NotifyHolder = New("Frame", {
 		BackgroundTransparency = 1,
 		Position = UDim2.fromOffset(12, 12),
@@ -313,22 +349,129 @@ end
 ---------------------------------------------------------------- notifications / watermark
 function Library:Notify(text, duration)
 	self:_Init()
-	local w = TextService:GetTextSize(text, self.TextSize, self.Font, Vector2.new(1000, 100)).X + 22
-	local outer, inner = Panel(self.NotifyHolder, Vector2.new(w, 26))
+	local w = TextService:GetTextSize(text, self.TextSize, self.Font, Vector2.new(1000, 100)).X + 30
+	-- the row keeps its slot in the list; the panel slides in/out inside it
+	local row = New("Frame", {
+		BackgroundTransparency = 1,
+		Size = UDim2.fromOffset(w, 26),
+		ClipsDescendants = true,
+		ZIndex = 120,
+		Parent = self.NotifyHolder,
+	})
+	local outer, inner = Panel(row, Vector2.new(w, 26))
 	outer.ZIndex = 120
+	outer.Position = UDim2.fromOffset(-w - 8, 0)
 	GradBar(inner, 2)
+	New("Frame", {
+		BackgroundColor3 = THEME.Accent,
+		Position = UDim2.fromOffset(0, 2),
+		Size = UDim2.new(0, 2, 1, -2),
+		Parent = inner,
+	})
 	New("TextLabel", {
 		Text = text,
 		Size = UDim2.fromScale(1, 1),
-		Position = UDim2.fromOffset(9, 1),
+		Position = UDim2.fromOffset(11, 1),
 		TextColor3 = THEME.TextBright,
 		Parent = inner,
 	})
+	TweenService:Create(outer, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		Position = UDim2.fromOffset(0, 0),
+	}):Play()
 	task.delay(duration or 3, function()
-		if outer.Parent then
-			outer:Destroy()
+		if not outer.Parent then
+			return
 		end
+		local t = TweenService:Create(outer, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+			Position = UDim2.fromOffset(-w - 8, 0),
+		})
+		t.Completed:Once(function()
+			if row.Parent then
+				row:Destroy()
+			end
+		end)
+		t:Play()
 	end)
+end
+
+-- fn(fps, frameMs) is called every 0.5s from the shared ticker
+function Library:OnStats(fn)
+	self:_Init()
+	table.insert(self._stats, fn)
+end
+
+---------------------------------------------------------------- keybind list overlay (gamesense hotkey list)
+function Library:_UpdateKeyList()
+	local kl = self._keylist
+	if not kl or not kl.holder.Visible then
+		return
+	end
+	for _, c in ipairs(kl.content:GetChildren()) do
+		if c:IsA("TextLabel") then
+			c:Destroy()
+		end
+	end
+	local n = 0
+	for _, K in ipairs(self._kbs) do
+		if K.State and K.Mode ~= "Always" then
+			n += 1
+			New("TextLabel", {
+				Text = string.format("[%s] %s", K.Mode == "Hold" and "holding" or "toggled", K.ListText or "?"),
+				TextColor3 = THEME.TextBright,
+				Size = UDim2.new(1, 0, 0, 14),
+				LayoutOrder = n,
+				Parent = kl.content,
+			})
+		end
+	end
+end
+
+function Library:SetKeybindList(on)
+	self:_Init()
+	if not on then
+		if self._keylist then
+			self._keylist.holder.Visible = false
+		end
+		return
+	end
+	if not self._keylist then
+		local holder = New("Frame", {
+			BackgroundColor3 = THEME.Outer,
+			Position = UDim2.new(0, 12, 0.45, 0),
+			Size = UDim2.fromOffset(170, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			ZIndex = 110,
+			Parent = self.Gui,
+		}, { Pad(1, 1, 1, 1) })
+		local inner = New("Frame", {
+			BackgroundColor3 = THEME.Background,
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			Parent = holder,
+		})
+		GradBar(inner, 2)
+		New("TextLabel", {
+			Text = "keybinds",
+			TextXAlignment = CENTER,
+			TextColor3 = THEME.TextBright,
+			Position = UDim2.fromOffset(0, 3),
+			Size = UDim2.new(1, 0, 0, 16),
+			Parent = inner,
+		})
+		local content = New("Frame", {
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(0, 20),
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			Parent = inner,
+		}, {
+			New("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }),
+			Pad(8, 0, 8, 6),
+		})
+		self._keylist = { holder = holder, content = content }
+	end
+	self._keylist.holder.Visible = true
+	self:_UpdateKeyList()
 end
 
 function Library:SetWatermark(text)
@@ -365,13 +508,8 @@ function Library:SetWatermark(text)
 		}, { Pad(9, 2, 9, 0) })
 		self._wm = outer
 
-		local acc, frames, fps = 0, 0, 60
-		connect(RunService.RenderStepped, function(dt)
-			acc += dt
-			frames += 1
-			if acc >= 0.5 then
-				fps = math.floor(frames / acc + 0.5)
-				acc, frames = 0, 0
+		self:OnStats(function(fps)
+			if self._wm and self._wm.Visible and self._wmLabel then
 				self._wmLabel.Text = (self._wmText or "") .. " | " .. fps .. " fps"
 			end
 		end)
@@ -384,6 +522,9 @@ end
 function Library:ExportConfig()
 	local data = {}
 	for flag, opt in pairs(self.Options) do
+		if opt.NoConfig then
+			continue
+		end
 		local v = opt.Value
 		if typeof(v) == "Color3" then
 			v = { __color = v:ToHex() }
@@ -402,16 +543,45 @@ function Library:ImportConfig(json)
 	if not ok or type(data) ~= "table" then
 		return false
 	end
+	return self:ApplyConfig(data, false)
+end
+
+-- data = { flag = value }, values may be Color3 / {__color=hex} / {__key=name}.
+-- reset = true switches every other toggle back to its default first.
+-- Dropdowns are applied first, then sliders/colors, then toggles, so presets never overwrite explicit values.
+function Library:ApplyConfig(data, reset)
+	if type(data) ~= "table" then
+		return false
+	end
+	if reset then
+		for flag, opt in pairs(self.Options) do
+			if opt.Type == "Toggle" and not opt.NoConfig and not opt.NoReset and data[flag] == nil and opt.Set then
+				pcall(opt.Set, opt, opt.Default == true)
+			end
+		end
+	end
+	local order = { Dropdown = 1, Textbox = 2, Keybind = 2, Slider = 3, ColorPicker = 3, Toggle = 4 }
+	local list = {}
 	for flag, v in pairs(data) do
 		local opt = self.Options[flag]
-		if opt and opt.Set then
+		if opt and opt.Set and not opt.NoConfig then
 			if type(v) == "table" and v.__color then
 				v = Color3.fromHex(v.__color)
 			elseif type(v) == "table" and v.__key then
 				v = v.__key
 			end
-			pcall(opt.Set, opt, v)
+			list[#list + 1] = { flag, opt, v }
 		end
+	end
+	table.sort(list, function(a, b)
+		local oa, ob = order[a[2].Type] or 3, order[b[2].Type] or 3
+		if oa ~= ob then
+			return oa < ob
+		end
+		return a[1] < b[1]
+	end)
+	for _, e in ipairs(list) do
+		pcall(e[2].Set, e[2], e[3])
 	end
 	return true
 end
@@ -424,7 +594,9 @@ function Library:Unload()
 	if self.Gui then
 		self.Gui:Destroy()
 	end
-	self.Gui, self.Catcher, self._wm, self._popup = nil, nil, nil, nil
+	self.Gui, self.Catcher, self._wm, self._wmLabel, self._popup = nil, nil, nil, nil, nil
+	self._keylist, self._kbs, self._stats = nil, {}, {}
+	activeDrag = nil
 	table.clear(self.Flags)
 	table.clear(self.Options)
 end
@@ -2970,5 +3142,4 @@ end)
 
 Library:SetWatermark("logicsense")
 Library:Notify("Loaded - press RightShift to toggle the menu", 4)
-
 
