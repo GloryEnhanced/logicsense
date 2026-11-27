@@ -268,6 +268,7 @@ local function Base(flag, o, value, typ)
 		Flag = flag,
 		Value = value,
 		Default = o.Default,
+		Text = o.Text,
 		Callback = o.Callback,
 		NoConfig = o.NoConfig, -- not saved/loaded in configs (UI-only options)
 		NoReset = o.NoReset, -- not touched when a config resets toggles
@@ -570,7 +571,10 @@ function Library:ApplyConfig(data, reset)
 			elseif type(v) == "table" and v.__key then
 				v = v.__key
 			end
-			list[#list + 1] = { flag, opt, v }
+			-- skip options that already hold this value (keeps config loads fast: no pointless callbacks)
+			if type(v) == "table" or opt.Value ~= v then
+				list[#list + 1] = { flag, opt, v }
+			end
 		end
 	end
 	table.sort(list, function(a, b)
@@ -789,6 +793,7 @@ function Library:CreateWindow(opts)
 		end
 		root.Visible = v
 		modal.Modal = v
+		Library.MenuVisible = v
 		ClosePopup()
 	end
 
@@ -805,7 +810,7 @@ function Library:CreateWindow(opts)
 			Text = name,
 			TextXAlignment = CENTER,
 			BackgroundColor3 = THEME.Background,
-			Size = UDim2.new(1, 0, 0, 50),
+			Size = UDim2.new(1, 0, 0, 42),
 			LayoutOrder = #Window.Tabs + 1,
 			Parent = sidebar,
 		})
@@ -1099,10 +1104,20 @@ function Library:CreateWindow(opts)
 				btn.MouseEnter:Connect(function() btn.BackgroundColor3 = THEME.ControlHover end)
 				btn.MouseLeave:Connect(function() btn.BackgroundColor3 = THEME.Control end)
 
-				local pop, popIn = Panel(Library.Gui, Vector2.new(100, 24))
+				local pop, popInner = Panel(Library.Gui, Vector2.new(100, 24))
 				pop.Visible = false
 				pop.ZIndex = 100
-				New("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Parent = popIn })
+				-- long lists (configs, skyboxes, shaders) scroll instead of running off screen
+				local popIn = New("ScrollingFrame", {
+					BackgroundTransparency = 1,
+					Size = UDim2.fromScale(1, 1),
+					ScrollBarThickness = 3,
+					ScrollBarImageColor3 = THEME.Accent,
+					CanvasSize = UDim2.new(),
+					AutomaticCanvasSize = Enum.AutomaticSize.Y,
+					ScrollingDirection = Enum.ScrollingDirection.Y,
+					Parent = popInner,
+				}, { New("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }) })
 				local items = {}
 
 				local function display()
@@ -1179,7 +1194,7 @@ function Library:CreateWindow(opts)
 				end
 
 				btn.MouseButton1Click:Connect(function()
-					pop.Size = UDim2.fromOffset(box.AbsoluteSize.X, #D.Values * 18 + 4)
+					pop.Size = UDim2.fromOffset(box.AbsoluteSize.X, math.min(#D.Values, 10) * 18 + 4)
 					pop.Position = UDim2.fromOffset(box.AbsolutePosition.X, box.AbsolutePosition.Y + box.AbsoluteSize.Y - 1)
 					OpenPopup(pop)
 				end)
@@ -1196,9 +1211,11 @@ function Library:CreateWindow(opts)
 				local K = Base(flag, o, default, "Keybind")
 				K.Mode = o.Mode or "Toggle"
 				K.State = K.Mode == "Always"
+				K.ListText = o.Text or tostring(flag)
 				if flag then
 					Library.Flags[flag] = K.State
 				end
+				table.insert(Library._kbs, K)
 
 				local r = row(16)
 				New("TextLabel", { Text = o.Text or tostring(flag), Size = UDim2.fromScale(1, 1), Parent = r })
@@ -1232,6 +1249,7 @@ function Library:CreateWindow(opts)
 					if flag then
 						Library.Flags[flag] = st
 					end
+					Library:_UpdateKeyList()
 					if K.Callback then
 						task.spawn(K.Callback, st)
 					end
@@ -1460,36 +1478,78 @@ end
 ---------------------------------------------------------------- feature factory
 -- def.Global(tr)   : runs once when enabled
 -- def.Inst(tr, d)  : runs for every existing + newly added workspace descendant
+-- PERFORMANCE: every Inst feature shares ONE workspace.DescendantAdded connection and ONE
+-- chunked scan of the workspace (instead of one connection + one full scan per feature).
+local activeInst = {} -- features currently enabled that have an Inst handler
+local activeCount = 0
+local dispatchConn = nil
+local scanQueue = {} -- features waiting for their first scan
+local scanning = false
+
+local function runScan()
+	if scanning then
+		return
+	end
+	scanning = true
+	task.spawn(function()
+		while #scanQueue > 0 do
+			local batch = scanQueue
+			scanQueue = {}
+			local list = workspace:GetDescendants()
+			for i, d in ipairs(list) do
+				for _, F in ipairs(batch) do
+					if F.Enabled and F.def.Inst then
+						pcall(F.def.Inst, F.tr, d)
+					end
+				end
+				if i % 600 == 0 then
+					task.wait()
+				end
+			end
+		end
+		scanning = false
+	end)
+end
+
+local function addActive(F)
+	activeInst[F] = true
+	activeCount += 1
+	if not dispatchConn then
+		dispatchConn = workspace.DescendantAdded:Connect(function(d)
+			for f in pairs(activeInst) do
+				pcall(f.def.Inst, f.tr, d)
+			end
+		end)
+	end
+end
+
+local function removeActive(F)
+	if activeInst[F] then
+		activeInst[F] = nil
+		activeCount -= 1
+		if activeCount <= 0 and dispatchConn then
+			dispatchConn:Disconnect()
+			dispatchConn = nil
+			activeCount = 0
+		end
+	end
+end
+
 local function Feature(def)
-	local F = { Enabled = false, tr = newTracker(), token = 0 }
+	local F = { Enabled = false, tr = newTracker(), def = def }
 
 	function F:Enable()
 		if self.Enabled then
 			return
 		end
 		self.Enabled = true
-		self.token += 1
-		local token = self.token
-
 		if def.Global then
 			pcall(def.Global, self.tr)
 		end
 		if def.Inst then
-			table.insert(self.tr.conns, workspace.DescendantAdded:Connect(function(d)
-				pcall(def.Inst, self.tr, d)
-			end))
-			task.spawn(function()
-				local list = workspace:GetDescendants()
-				for i, d in ipairs(list) do
-					if self.token ~= token or not self.Enabled then
-						return
-					end
-					pcall(def.Inst, self.tr, d)
-					if i % 300 == 0 then
-						task.wait()
-					end
-				end
-			end)
+			addActive(self)
+			table.insert(scanQueue, self)
+			runScan()
 		end
 	end
 
@@ -1498,7 +1558,7 @@ local function Feature(def)
 			return
 		end
 		self.Enabled = false
-		self.token += 1
+		removeActive(self)
 		restore(self.tr)
 	end
 
@@ -1558,10 +1618,142 @@ local BoosterDefs = {
 		end,
 	},
 	meshes = {
+		Global = function(tr)
+			local ok, rendering = pcall(function()
+				return settings().Rendering
+			end)
+			if ok then
+				track(tr, rendering, "MeshPartDetailLevel", Enum.MeshPartDetailLevel.Level04)
+			end
+		end,
 		Inst = function(tr, d)
 			if d:IsA("MeshPart") then
 				track(tr, d, "RenderFidelity", Enum.RenderFidelity.Performance)
 			end
+		end,
+	},
+	lights = {
+		Inst = function(tr, d)
+			if d:IsA("Light") then
+				track(tr, d, "Enabled", false)
+			end
+		end,
+	},
+	envmap = {
+		Global = function(tr)
+			track(tr, Lighting, "EnvironmentSpecularScale", 0)
+		end,
+	},
+	reflect = {
+		Inst = function(tr, d)
+			if isPart(d) and d.Reflectance > 0 then
+				track(tr, d, "Reflectance", 0)
+			end
+		end,
+	},
+	skyfx = {
+		-- atmosphere + clouds cost fill-rate on every pixel of the sky
+		Global = function(tr)
+			for _, d in ipairs(Lighting:GetChildren()) do
+				if d:IsA("Atmosphere") and not isOurs(d) then
+					track(tr, d, "Density", 0)
+					track(tr, d, "Haze", 0)
+					track(tr, d, "Glare", 0)
+				end
+			end
+			local clouds = workspace.Terrain:FindFirstChildOfClass("Clouds")
+			if clouds then
+				track(tr, clouds, "Enabled", false)
+			end
+		end,
+	},
+	gui3d = {
+		Inst = function(tr, d)
+			if d:IsA("BillboardGui") or d:IsA("SurfaceGui") then
+				track(tr, d, "Enabled", false)
+			end
+		end,
+	},
+	highlights = {
+		Inst = function(tr, d)
+			if d:IsA("Highlight") and not isOurs(d) then
+				track(tr, d, "Enabled", false)
+			end
+		end,
+	},
+	otheracc = {
+		-- other players' hats / accessories are a big part of the draw cost in crowded servers
+		Inst = function(tr, d)
+			if d:IsA("Accessory") then
+				local me = Players.LocalPlayer and Players.LocalPlayer.Character
+				if me and d:IsDescendantOf(me) then
+					return
+				end
+				for _, p in ipairs(d:GetDescendants()) do
+					if p:IsA("BasePart") then
+						track(tr, p, "Transparency", 1)
+					end
+				end
+			end
+		end,
+	},
+	cull = {
+		-- distance culling: parts farther than Graphics.CullDistance from the camera are hidden
+		-- (fully transparent parts are skipped by the renderer). Time-sliced, ~250 parts per frame.
+		Global = function(tr)
+			local list, culled, cursor = {}, {}, 1
+			tr.cull = { list = list }
+			table.insert(tr.conns, RunService.Heartbeat:Connect(function()
+				local n = #list
+				local cam = workspace.CurrentCamera
+				if n == 0 or not cam then
+					return
+				end
+				local cp = cam.CFrame.Position
+				local D = Graphics.CullDistance
+				for _ = 1, math.min(250, n) do
+					if cursor > n then
+						cursor = 1
+					end
+					local p = list[cursor]
+					if not p.Parent then
+						list[cursor] = list[n]
+						list[n] = nil
+						n -= 1
+						culled[p] = nil
+					else
+						local far = (p.Position - cp).Magnitude > D + p.Size.Magnitude * 0.5
+						if far ~= (culled[p] == true) then
+							culled[p] = far or nil
+							p.LocalTransparencyModifier = far and 1 or 0
+						end
+						cursor += 1
+					end
+					if n == 0 then
+						break
+					end
+				end
+			end))
+			table.insert(tr.conns, {
+				Disconnect = function()
+					for p in pairs(culled) do
+						pcall(function()
+							p.LocalTransparencyModifier = 0
+						end)
+					end
+					table.clear(culled)
+				end,
+			})
+		end,
+		Inst = function(tr, d)
+			if not tr.cull or not isPart(d) or d.Size.Magnitude > 250 then
+				return
+			end
+			local m = d:FindFirstAncestorOfClass("Model")
+			if m and m:FindFirstChildOfClass("Humanoid") then
+				return -- never cull characters
+			end
+			table.insert(tr.cull.list, d)
 		end,
 	},
 	decor = {
@@ -1626,6 +1818,8 @@ local TextureDefs = {
 	},
 }
 
+Graphics.CullDistance = 300
+
 Graphics.Features = { Booster = {}, Textures = {} }
 for k, def in pairs(BoosterDefs) do
 	Graphics.Features.Booster[k] = Feature(def)
@@ -1661,6 +1855,7 @@ local Shaders = {
 		"Cold Blue", "Dreamy", "Retro", "Night Vision",
 		"Cyberpunk", "Horror", "Underwater", "Sepia", "Pastel", "Desert Heat",
 		"Matrix", "Arctic", "Toxic", "Moody Fog", "Vintage Film", "Golden Glow",
+		"Bright & Clean", "Anime", "Nightclub", "Autumn", "Sunrise", "Nuclear", "Lo-Fi", "Ocean Blue",
 	},
 	Presets = {
 		["Low Quality"] = {
@@ -1806,6 +2001,55 @@ local Shaders = {
 			Atmo = { Density = 0.28, Offset = 0.25, Color = C(255, 220, 170), Decay = C(230, 160, 100), Glare = 0.6, Haze = 1.8 },
 			Light = { ExposureCompensation = 0.15, ColorShift_Top = C(255, 200, 120) },
 		},
+		["Bright & Clean"] = {
+			Bloom = { Intensity = 0.25, Size = 24, Threshold = 1.7 },
+			CC = { Contrast = 0.08, Saturation = 0.18, Brightness = 0.04, Tint = C(255, 253, 250) },
+			Rays = { Intensity = 0.06, Spread = 0.5 },
+			Light = { ExposureCompensation = 0.2, ShadowSoftness = 0.3 },
+		},
+		["Anime"] = {
+			Bloom = { Intensity = 0.5, Size = 30, Threshold = 1.2 },
+			CC = { Contrast = 0.22, Saturation = 0.55, Brightness = 0.04, Tint = C(255, 245, 250) },
+			Rays = { Intensity = 0.14, Spread = 0.8 },
+			Atmo = { Density = 0.2, Offset = 0.35, Color = C(200, 220, 255), Decay = C(160, 180, 230), Glare = 0.3, Haze = 0.8 },
+		},
+		["Nightclub"] = {
+			Bloom = { Intensity = 0.9, Size = 48, Threshold = 0.8 },
+			CC = { Contrast = 0.25, Saturation = 0.6, Brightness = -0.04, Tint = C(240, 200, 255) },
+			Atmo = { Density = 0.4, Offset = 0, Color = C(90, 40, 150), Decay = C(40, 15, 90), Glare = 0, Haze = 2.5 },
+			Light = { ExposureCompensation = -0.2, Ambient = C(50, 20, 80), OutdoorAmbient = C(70, 30, 110) },
+		},
+		["Autumn"] = {
+			Bloom = { Intensity = 0.3, Size = 26, Threshold = 1.4 },
+			CC = { Contrast = 0.12, Saturation = 0.2, Brightness = 0.01, Tint = C(255, 225, 190) },
+			Rays = { Intensity = 0.14, Spread = 0.8 },
+			Atmo = { Density = 0.3, Offset = 0.2, Color = C(230, 200, 170), Decay = C(180, 120, 80), Glare = 0.3, Haze = 1.5 },
+			Light = { ColorShift_Top = C(255, 190, 120) },
+		},
+		["Sunrise"] = {
+			Bloom = { Intensity = 0.5, Size = 34, Threshold = 1.2 },
+			CC = { Contrast = 0.1, Saturation = 0.25, Tint = C(255, 220, 200) },
+			Rays = { Intensity = 0.3, Spread = 1 },
+			Atmo = { Density = 0.3, Offset = 0.3, Color = C(255, 205, 175), Decay = C(240, 140, 120), Glare = 0.7, Haze = 1.6 },
+			Light = { ClockTime = 6.2, ColorShift_Top = C(255, 170, 110) },
+		},
+		["Nuclear"] = {
+			Bloom = { Intensity = 0.8, Size = 40, Threshold = 0.9 },
+			CC = { Contrast = 0.3, Saturation = 0.4, Brightness = 0.02, Tint = C(255, 240, 150) },
+			Atmo = { Density = 0.5, Offset = 0, Color = C(210, 200, 90), Decay = C(120, 100, 30), Glare = 0, Haze = 3 },
+			Light = { ExposureCompensation = -0.1, ColorShift_Top = C(255, 220, 80) },
+		},
+		["Lo-Fi"] = {
+			Bloom = { Intensity = 0.4, Size = 32, Threshold = 1.2 },
+			CC = { Contrast = -0.05, Saturation = -0.15, Brightness = 0.02, Tint = C(255, 230, 235) },
+			Blur = { Size = 1.2 },
+		},
+		["Ocean Blue"] = {
+			Bloom = { Intensity = 0.35, Size = 28, Threshold = 1.4 },
+			CC = { Contrast = 0.1, Saturation = 0.3, Tint = C(190, 225, 255) },
+			Rays = { Intensity = 0.12, Spread = 0.8 },
+			Atmo = { Density = 0.32, Offset = 0.15, Color = C(150, 200, 235), Decay = C(70, 120, 180), Glare = 0.3, Haze = 1.8 },
+		},
 	},
 }
 
@@ -1877,6 +2121,8 @@ function Shaders:Apply(name)
 		for _, d in ipairs(Lighting:GetChildren()) do
 			if d:IsA("Atmosphere") and not isOurs(d) then
 				detach(self.tr, d)
+			elseif d.Name == PREFIX .. "SkyAtmo" then
+				d:Destroy()
 			end
 		end
 		make("Atmosphere", "Atmosphere", {
@@ -1932,6 +2178,9 @@ local Sky = {
 	Order = {
 		"Off (game default)", "Roblox Default", "Clear Noon", "Golden Hour", "Sunset", "Dawn",
 		"Night", "Starry Night", "Blood Moon", "Space", "Gloomy", "Vaporwave",
+		"Purple Nebula", "Aurora", "Crimson Dusk", "Emerald Dawn", "Sakura", "Neon City",
+		"Storm", "Foggy Morning", "Toxic Sky", "Deep Ocean", "Midnight Blue", "Infrared",
+		"Eclipse", "Twilight", "Heaven", "Candy", "Desert Noon", "Snowfall", "Lava World", "Cosmic Dust",
 	},
 	Presets = {
 		["Roblox Default"] = { Faces = DEFAULT_FACES, StarCount = 3000, Light = { ClockTime = 14 } },
@@ -1975,14 +2224,129 @@ local Sky = {
 				Ambient = C(120, 60, 140), OutdoorAmbient = C(140, 80, 170),
 			},
 		},
+		-- The presets below tint the whole sky with an Atmosphere (plus stars / clouds / lighting),
+		-- so they work without any image assets.
+		["Purple Nebula"] = {
+			Faces = BLANK_FACES, StarCount = 14000, Moon = 16,
+			Atmo = { Density = 0.35, Offset = 0.5, Color = C(150, 70, 210), Decay = C(70, 20, 130), Glare = 0, Haze = 1.2 },
+			Light = { ClockTime = 0, ColorShift_Top = C(190, 100, 255), OutdoorAmbient = C(90, 50, 140), Ambient = C(45, 25, 80) },
+		},
+		["Aurora"] = {
+			Faces = BLANK_FACES, StarCount = 11000, Moon = 12,
+			Atmo = { Density = 0.3, Offset = 0.6, Color = C(60, 220, 170), Decay = C(20, 110, 140), Glare = 0, Haze = 1 },
+			Light = { ClockTime = 0, ColorShift_Top = C(80, 255, 190), OutdoorAmbient = C(50, 110, 120), Ambient = C(20, 50, 70) },
+		},
+		["Crimson Dusk"] = {
+			Faces = DEFAULT_FACES, StarCount = 1000,
+			Atmo = { Density = 0.38, Offset = 0.3, Color = C(255, 90, 60), Decay = C(150, 30, 40), Glare = 0.8, Haze = 2 },
+			Light = { ClockTime = 18.4, ColorShift_Top = C(255, 90, 50), OutdoorAmbient = C(130, 60, 60) },
+		},
+		["Emerald Dawn"] = {
+			Faces = DEFAULT_FACES, StarCount = 1200,
+			Atmo = { Density = 0.3, Offset = 0.3, Color = C(160, 255, 200), Decay = C(60, 160, 120), Glare = 0.5, Haze = 1.5 },
+			Light = { ClockTime = 5.9, ColorShift_Top = C(150, 255, 190), OutdoorAmbient = C(90, 130, 110) },
+		},
+		["Sakura"] = {
+			Faces = DEFAULT_FACES, StarCount = 0,
+			Atmo = { Density = 0.28, Offset = 0.4, Color = C(255, 200, 220), Decay = C(235, 150, 190), Glare = 0.4, Haze = 1.2 },
+			Clouds = { Cover = 0.55, Density = 0.55, Color = C(255, 225, 238) },
+			Light = { ClockTime = 16.5, ColorShift_Top = C(255, 190, 215), OutdoorAmbient = C(170, 130, 150) },
+		},
+		["Neon City"] = {
+			Faces = BLANK_FACES, StarCount = 500, Bodies = false,
+			Atmo = { Density = 0.4, Offset = 0.4, Color = C(255, 50, 200), Decay = C(40, 60, 200), Glare = 0, Haze = 2.5 },
+			Light = { ClockTime = 0, ColorShift_Top = C(255, 60, 210), ColorShift_Bottom = C(60, 120, 255), OutdoorAmbient = C(110, 50, 150), Ambient = C(50, 25, 90) },
+		},
+		["Storm"] = {
+			Faces = DEFAULT_FACES, StarCount = 0, Bodies = false,
+			Atmo = { Density = 0.5, Offset = 0, Color = C(90, 100, 115), Decay = C(50, 58, 72), Glare = 0, Haze = 3 },
+			Clouds = { Cover = 0.95, Density = 0.9, Color = C(70, 75, 85) },
+			Light = { ClockTime = 13, Brightness = 1, Ambient = C(70, 75, 85), OutdoorAmbient = C(90, 95, 105) },
+		},
+		["Foggy Morning"] = {
+			Faces = DEFAULT_FACES, StarCount = 0, Bodies = false,
+			Atmo = { Density = 0.6, Offset = 0.1, Color = C(215, 220, 225), Decay = C(180, 188, 196), Glare = 0, Haze = 4 },
+			Clouds = { Cover = 0.7, Density = 0.6, Color = C(225, 228, 232) },
+			Light = { ClockTime = 7, Ambient = C(120, 125, 135), OutdoorAmbient = C(140, 145, 155) },
+		},
+		["Toxic Sky"] = {
+			Faces = DEFAULT_FACES, StarCount = 0, Bodies = false,
+			Atmo = { Density = 0.45, Offset = 0.2, Color = C(150, 220, 60), Decay = C(70, 120, 20), Glare = 0, Haze = 2.5 },
+			Clouds = { Cover = 0.8, Density = 0.7, Color = C(130, 190, 70) },
+			Light = { ClockTime = 15, ColorShift_Top = C(190, 255, 90), OutdoorAmbient = C(90, 120, 50) },
+		},
+		["Deep Ocean"] = {
+			Faces = BLANK_FACES, StarCount = 0, Bodies = false,
+			Atmo = { Density = 0.55, Offset = 0, Color = C(20, 110, 160), Decay = C(5, 40, 80), Glare = 0, Haze = 4 },
+			Light = { ClockTime = 12, ColorShift_Top = C(80, 190, 230), OutdoorAmbient = C(30, 90, 130), Ambient = C(10, 40, 70) },
+		},
+		["Midnight Blue"] = {
+			Faces = BLANK_FACES, StarCount = 8000, Moon = 18,
+			Atmo = { Density = 0.3, Offset = 0.4, Color = C(40, 70, 160), Decay = C(15, 25, 80), Glare = 0, Haze = 1 },
+			Light = { ClockTime = 0, OutdoorAmbient = C(40, 55, 120), Ambient = C(15, 22, 55) },
+		},
+		["Infrared"] = {
+			Faces = BLANK_FACES, StarCount = 6000, Moon = 10,
+			Atmo = { Density = 0.35, Offset = 0.3, Color = C(255, 30, 60), Decay = C(120, 0, 30), Glare = 0, Haze = 2 },
+			Light = { ClockTime = 0, ColorShift_Top = C(255, 30, 50), OutdoorAmbient = C(140, 20, 40), Ambient = C(60, 5, 15) },
+		},
+		["Eclipse"] = {
+			Faces = BLANK_FACES, StarCount = 7000, Sun = 28, Moon = 28,
+			Atmo = { Density = 0.4, Offset = 0.2, Color = C(200, 110, 40), Decay = C(60, 25, 10), Glare = 1, Haze = 2 },
+			Light = { ClockTime = 12, Brightness = 0.6, ExposureCompensation = -0.8, OutdoorAmbient = C(70, 50, 40), Ambient = C(35, 25, 20) },
+		},
+		["Twilight"] = {
+			Faces = DEFAULT_FACES, StarCount = 3000, Moon = 14,
+			Atmo = { Density = 0.33, Offset = 0.35, Color = C(150, 120, 200), Decay = C(70, 50, 130), Glare = 0.2, Haze = 1.6 },
+			Light = { ClockTime = 18.9, ColorShift_Top = C(190, 140, 230), OutdoorAmbient = C(100, 85, 140) },
+		},
+		["Heaven"] = {
+			Faces = DEFAULT_FACES, StarCount = 0,
+			Atmo = { Density = 0.25, Offset = 0.5, Color = C(255, 245, 220), Decay = C(255, 215, 150), Glare = 1.2, Haze = 1 },
+			Clouds = { Cover = 0.75, Density = 0.4, Color = C(255, 250, 240) },
+			Light = { ClockTime = 12.5, Brightness = 3, ExposureCompensation = 0.3, ColorShift_Top = C(255, 235, 190), OutdoorAmbient = C(190, 180, 160) },
+		},
+		["Candy"] = {
+			Faces = DEFAULT_FACES, StarCount = 0,
+			Atmo = { Density = 0.3, Offset = 0.45, Color = C(255, 170, 230), Decay = C(150, 210, 255), Glare = 0.3, Haze = 1.3 },
+			Clouds = { Cover = 0.6, Density = 0.6, Color = C(255, 205, 240) },
+			Light = { ClockTime = 14, ColorShift_Top = C(255, 190, 235), OutdoorAmbient = C(200, 150, 210) },
+		},
+		["Desert Noon"] = {
+			Faces = DEFAULT_FACES, StarCount = 0,
+			Atmo = { Density = 0.3, Offset = 0.2, Color = C(245, 215, 160), Decay = C(210, 150, 90), Glare = 0.6, Haze = 2.5 },
+			Light = { ClockTime = 12, Brightness = 3, ColorShift_Top = C(255, 215, 150), OutdoorAmbient = C(170, 140, 100) },
+		},
+		["Snowfall"] = {
+			Faces = DEFAULT_FACES, StarCount = 0, Bodies = false,
+			Atmo = { Density = 0.5, Offset = 0.1, Color = C(225, 232, 240), Decay = C(185, 200, 215), Glare = 0, Haze = 3.5 },
+			Clouds = { Cover = 0.9, Density = 0.7, Color = C(220, 226, 235) },
+			Light = { ClockTime = 11, Ambient = C(130, 140, 155), OutdoorAmbient = C(150, 160, 175) },
+		},
+		["Lava World"] = {
+			Faces = BLANK_FACES, StarCount = 0, Bodies = false,
+			Atmo = { Density = 0.5, Offset = 0, Color = C(255, 90, 20), Decay = C(120, 25, 0), Glare = 0, Haze = 3.5 },
+			Clouds = { Cover = 0.85, Density = 0.8, Color = C(90, 30, 15) },
+			Light = { ClockTime = 17, ColorShift_Top = C(255, 100, 30), OutdoorAmbient = C(150, 50, 20), Ambient = C(70, 20, 5) },
+		},
+		["Cosmic Dust"] = {
+			Faces = BLANK_FACES, StarCount = 20000, Bodies = false,
+			Atmo = { Density = 0.22, Offset = 0.6, Color = C(110, 120, 230), Decay = C(210, 100, 200), Glare = 0, Haze = 0.8 },
+			Light = { ClockTime = 0, OutdoorAmbient = C(70, 70, 140), Ambient = C(35, 35, 80) },
+		},
 	},
 }
 
 function Sky:_clear()
 	for _, d in ipairs(Lighting:GetChildren()) do
-		if isOurs(d) and d:IsA("Sky") then
+		if isOurs(d) and (d:IsA("Sky") or d.Name == PREFIX .. "SkyAtmo") then
 			d:Destroy()
 		end
+	end
+	local terrain = workspace.Terrain
+	local c = terrain:FindFirstChild(PREFIX .. "SkyClouds")
+	if c then
+		c:Destroy()
 	end
 end
 
@@ -2011,6 +2375,40 @@ function Sky:Apply(name)
 	sky.Parent = Lighting
 	for k, v in pairs(p.Light or {}) do
 		track(self.tr, Lighting, k, v)
+	end
+	if p.Atmo then
+		-- only one Atmosphere is active: park the game's own and any shader-preset one
+		for _, d in ipairs(Lighting:GetChildren()) do
+			if d:IsA("Atmosphere") and not isOurs(d) then
+				detach(self.tr, d)
+			elseif d.Name == PREFIX .. "Atmosphere" then
+				d:Destroy()
+			end
+		end
+		local a = Instance.new("Atmosphere")
+		a.Name = PREFIX .. "SkyAtmo"
+		a:SetAttribute("Custom", true) -- survives the shader preset cleanup
+		a.Density = p.Atmo.Density or 0.3
+		a.Offset = p.Atmo.Offset or 0
+		a.Color = p.Atmo.Color or Color3.new(1, 1, 1)
+		a.Decay = p.Atmo.Decay or Color3.new(0, 0, 0)
+		a.Glare = p.Atmo.Glare or 0
+		a.Haze = p.Atmo.Haze or 0
+		a.Parent = Lighting
+	end
+	if p.Clouds then
+		local terrain = workspace.Terrain
+		for _, c in ipairs(terrain:GetChildren()) do
+			if c:IsA("Clouds") and not isOurs(c) then
+				track(self.tr, c, "Enabled", false)
+			end
+		end
+		local c = Instance.new("Clouds")
+		c.Name = PREFIX .. "SkyClouds"
+		c.Cover = p.Clouds.Cover or 0.5
+		c.Density = p.Clouds.Density or 0.5
+		c.Color = p.Clouds.Color or Color3.new(1, 1, 1)
+		c.Parent = terrain
 	end
 	-- re-apply any sky tweaks from the World tab (star count, sun size, ...)
 	if Graphics.World then
@@ -2381,10 +2779,39 @@ function World:SetRainbow(on)
 	self:_updateLoop()
 end
 
+function World:SetTerrain(prop, value)
+	track(self.tr, workspace.Terrain, prop, value)
+end
+
+-- fullbright uses its own tracker so it can be switched off without touching other World tweaks
+function World:Fullbright(on)
+	self.fb = self.fb or newTracker()
+	restore(self.fb)
+	if not on then
+		return
+	end
+	local grey = C(178, 178, 178)
+	track(self.fb, Lighting, "Brightness", 2)
+	track(self.fb, Lighting, "ClockTime", 14)
+	track(self.fb, Lighting, "FogEnd", 100000)
+	track(self.fb, Lighting, "GlobalShadows", false)
+	track(self.fb, Lighting, "Ambient", grey)
+	track(self.fb, Lighting, "OutdoorAmbient", grey)
+	for _, d in ipairs(Lighting:GetChildren()) do
+		if d:IsA("Atmosphere") then
+			track(self.fb, d, "Density", 0)
+			track(self.fb, d, "Haze", 0)
+		end
+	end
+end
+
 function World:Reset()
 	self.cycle, self.rainbow = false, false
 	self:_updateLoop()
 	restore(self.tr)
+	if self.fb then
+		restore(self.fb)
+	end
 	for _, inst in ipairs(self.created) do
 		pcall(function()
 			inst:Destroy()
@@ -2518,11 +2945,248 @@ end
 
 Graphics.Custom = Custom
 
+---------------------------------------------------------------- weather (particles that follow your camera)
+local TEX_SOFT = "rbxasset://textures/particles/smoke_main.dds"
+local TEX_SPARK = "rbxasset://textures/particles/sparkles_main.dds"
+
+local WEATHER = {
+	["Rain"] = {
+		Height = 32, Area = Vector3.new(90, 1, 90), Dir = Enum.NormalId.Bottom, Texture = TEX_SPARK,
+		Rate = 450, Life = NumberRange.new(0.5, 0.7), Speed = NumberRange.new(70, 90), Size = 0.2,
+		Color = C(175, 195, 225), Alpha = 0.45, Accel = Vector3.new(0, -50, 0), Spread = 2, Parallel = true,
+	},
+	["Heavy Rain"] = {
+		Height = 32, Area = Vector3.new(90, 1, 90), Dir = Enum.NormalId.Bottom, Texture = TEX_SPARK,
+		Rate = 1100, Life = NumberRange.new(0.45, 0.65), Speed = NumberRange.new(85, 110), Size = 0.22,
+		Color = C(160, 180, 215), Alpha = 0.4, Accel = Vector3.new(0, -60, 0), Spread = 2, Parallel = true,
+	},
+	["Snow"] = {
+		Height = 34, Area = Vector3.new(90, 1, 90), Dir = Enum.NormalId.Bottom, Texture = TEX_SOFT,
+		Rate = 260, Life = NumberRange.new(5, 7), Speed = NumberRange.new(4, 8), Size = 0.3,
+		Color = C(255, 255, 255), Alpha = 0.15, Accel = Vector3.new(0, -2, 0), Spread = 25,
+	},
+	["Blizzard"] = {
+		Height = 30, Area = Vector3.new(100, 1, 100), Dir = Enum.NormalId.Bottom, Texture = TEX_SOFT,
+		Rate = 700, Life = NumberRange.new(2, 3), Speed = NumberRange.new(20, 30), Size = 0.35,
+		Color = C(240, 246, 255), Alpha = 0.2, Accel = Vector3.new(28, -4, 6), Spread = 15,
+	},
+	["Ash"] = {
+		Height = 30, Area = Vector3.new(90, 1, 90), Dir = Enum.NormalId.Bottom, Texture = TEX_SOFT,
+		Rate = 180, Life = NumberRange.new(5, 8), Speed = NumberRange.new(2, 5), Size = 0.25,
+		Color = C(120, 120, 125), Alpha = 0.3, Accel = Vector3.new(3, -1.5, 1), Spread = 30,
+	},
+	["Embers"] = {
+		Height = -4, Area = Vector3.new(80, 1, 80), Dir = Enum.NormalId.Top, Texture = TEX_SPARK,
+		Rate = 120, Life = NumberRange.new(3, 5), Speed = NumberRange.new(4, 9), Size = 0.3,
+		Color = C(255, 140, 40), Alpha = 0, Accel = Vector3.new(2, 3, 0), Spread = 25, Glow = 1,
+	},
+	["Fireflies"] = {
+		Height = 5, Area = Vector3.new(60, 14, 60), Dir = Enum.NormalId.Top, Texture = TEX_SOFT,
+		Rate = 14, Life = NumberRange.new(4, 6), Speed = NumberRange.new(0.5, 2), Size = 0.45,
+		Color = C(210, 255, 90), Alpha = 0.1, Accel = Vector3.new(0, 0.3, 0), Spread = 180, Glow = 1,
+	},
+	["Sakura Petals"] = {
+		Height = 28, Area = Vector3.new(80, 1, 80), Dir = Enum.NormalId.Bottom, Texture = TEX_SOFT,
+		Rate = 70, Life = NumberRange.new(5, 8), Speed = NumberRange.new(3, 6), Size = 0.45,
+		Color = C(255, 175, 205), Alpha = 0.1, Accel = Vector3.new(4, -1, 2), Spread = 40,
+	},
+	["Sandstorm"] = {
+		Height = 10, Area = Vector3.new(30, 24, 90), Dir = Enum.NormalId.Left, Texture = TEX_SOFT,
+		Rate = 500, Life = NumberRange.new(1.5, 2.5), Speed = NumberRange.new(40, 60), Size = 1.2,
+		Color = C(210, 170, 110), Alpha = 0.55, Accel = Vector3.new(30, 0, 0), Spread = 12,
+	},
+	["Stars"] = {
+		Height = 6, Area = Vector3.new(70, 24, 70), Dir = Enum.NormalId.Top, Texture = TEX_SPARK,
+		Rate = 30, Life = NumberRange.new(2, 4), Speed = NumberRange.new(0.2, 1), Size = 0.4,
+		Color = C(255, 255, 255), Alpha = 0, Accel = Vector3.new(0, 0, 0), Spread = 180, Glow = 1,
+	},
+}
+
+local WEATHER_ORDER = {
+	"Off", "Rain", "Heavy Rain", "Snow", "Blizzard", "Ash", "Embers", "Fireflies", "Sakura Petals", "Sandstorm", "Stars",
+}
+
+local Weather = { Type = "Off", Intensity = 1, Wind = 0, Order = WEATHER_ORDER, Override = nil }
+
+function Weather:Clear()
+	if self.conn then
+		self.conn:Disconnect()
+		self.conn = nil
+	end
+	if self.part then
+		self.part:Destroy()
+		self.part, self.emitter = nil, nil
+	end
+end
+
+function Weather:Apply()
+	local p = WEATHER[self.Type]
+	if not p then
+		return self:Clear()
+	end
+	if not self.part or not self.part.Parent then
+		self:Clear()
+		local part = Instance.new("Part")
+		part.Name = PREFIX .. "Weather"
+		part.Anchored, part.CanCollide, part.CanQuery, part.CanTouch, part.CastShadow = true, false, false, false, false
+		part.Transparency = 1
+		part.Parent = workspace.CurrentCamera or workspace
+		local em = Instance.new("ParticleEmitter")
+		em.Parent = part
+		self.part, self.emitter = part, em
+		self.conn = RunService.Heartbeat:Connect(function()
+			local cam = workspace.CurrentCamera
+			local cur = WEATHER[self.Type]
+			if cam and cur and self.part then
+				self.part.CFrame = CFrame.new(cam.CFrame.Position + Vector3.new(0, cur.Height, 0))
+			end
+		end)
+	end
+	self.part.Size = p.Area
+	local em = self.emitter
+	local col = self.Override or p.Color
+	em.Texture = p.Texture
+	em.Rate = p.Rate * self.Intensity
+	em.Lifetime = p.Life
+	em.Speed = p.Speed
+	em.Size = NumberSequence.new(p.Size)
+	em.Color = ColorSequence.new(col)
+	em.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 1),
+		NumberSequenceKeypoint.new(0.1, p.Alpha),
+		NumberSequenceKeypoint.new(0.9, p.Alpha),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	em.Acceleration = p.Accel + Vector3.new(self.Wind, 0, self.Wind * 0.3)
+	em.SpreadAngle = Vector2.new(p.Spread, p.Spread)
+	em.EmissionDirection = p.Dir
+	em.LightEmission = p.Glow or 0
+	em.Orientation = p.Parallel and Enum.ParticleOrientation.VelocityParallel or Enum.ParticleOrientation.FacingCamera
+	em.LockedToPart = false
+	em.Enabled = true
+end
+
+function Weather:Set(key, value)
+	self[key] = value
+	self:Apply()
+end
+
+Graphics.Weather = Weather
+
+---------------------------------------------------------------- screen overlay (tint, cinematic bars)
+local Overlay = {
+	On = { Tint = false, Bars = false },
+	V = { TintColor = C(255, 140, 60), TintAlpha = 0.88, Bars = 0.11 },
+}
+
+function Overlay:Update()
+	if not (self.On.Tint or self.On.Bars) then
+		if self.gui then
+			self.gui:Destroy()
+			self.gui, self.tint, self.top, self.bottom = nil, nil, nil, nil
+		end
+		return
+	end
+	if not self.gui then
+		local gui = Instance.new("ScreenGui")
+		gui.Name = PREFIX .. "Overlay"
+		gui.ResetOnSpawn = false
+		gui.IgnoreGuiInset = true
+		gui.DisplayOrder = 4
+		gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+		local function frame(color)
+			local f = Instance.new("Frame")
+			f.BorderSizePixel = 0
+			f.BackgroundColor3 = color
+			f.Active = false
+			f.Parent = gui
+			return f
+		end
+		self.gui = gui
+		self.tint = frame(Color3.new(1, 1, 1))
+		self.tint.Size = UDim2.fromScale(1, 1)
+		self.top = frame(Color3.new(0, 0, 0))
+		self.top.Size = UDim2.fromScale(1, 0)
+		self.bottom = frame(Color3.new(0, 0, 0))
+		self.bottom.AnchorPoint = Vector2.new(0, 1)
+		self.bottom.Position = UDim2.fromScale(0, 1)
+		self.bottom.Size = UDim2.fromScale(1, 0)
+	end
+	self.tint.Visible = self.On.Tint
+	self.tint.BackgroundColor3 = self.V.TintColor
+	self.tint.BackgroundTransparency = self.V.TintAlpha
+	local h = self.On.Bars and self.V.Bars or 0
+	self.top.Size = UDim2.fromScale(1, h)
+	self.bottom.Size = UDim2.fromScale(1, h)
+end
+
+function Overlay:Destroy()
+	self.On.Tint, self.On.Bars = false, false
+	self:Update()
+end
+
+Graphics.Overlay = Overlay
+
+---------------------------------------------------------------- camera (FOV, hold-to-zoom, zoom distance)
+local CAM_BIND = PREFIX .. "Camera"
+local CameraMod = {
+	tr = newTracker(),
+	FovOn = false, Fov = 90,
+	ZoomOn = false, ZoomFov = 30, Zooming = false,
+}
+
+function CameraMod:_update()
+	local need = self.FovOn or self.ZoomOn
+	if need and not self.bound then
+		local cam = workspace.CurrentCamera
+		self.orig = cam and cam.FieldOfView or 70
+		self.cur = nil
+		self.bound = true
+		-- runs right AFTER Roblox's own camera step so games can't overwrite the value
+		RunService:BindToRenderStep(CAM_BIND, Enum.RenderPriority.Camera.Value + 1, function(dt)
+			local c = workspace.CurrentCamera
+			if not c then
+				return
+			end
+			local target = (self.ZoomOn and self.Zooming) and self.ZoomFov or (self.FovOn and self.Fov or self.orig)
+			self.cur = self.cur and (self.cur + (target - self.cur) * math.min(1, dt * 14)) or target
+			c.FieldOfView = self.cur
+		end)
+	elseif not need and self.bound then
+		self.bound = false
+		RunService:UnbindFromRenderStep(CAM_BIND)
+		local c = workspace.CurrentCamera
+		if c and self.orig then
+			c.FieldOfView = self.orig
+		end
+	end
+end
+
+function CameraMod:SetZoomDistance(max)
+	if max then
+		track(self.tr, LocalPlayer, "CameraMaxZoomDistance", max)
+		track(self.tr, LocalPlayer, "CameraMinZoomDistance", 0)
+	else
+		restore(self.tr)
+	end
+end
+
+function CameraMod:Destroy()
+	self.FovOn, self.ZoomOn, self.Zooming = false, false, false
+	self:_update()
+	restore(self.tr)
+end
+
+Graphics.CameraMod = CameraMod
+
 ---------------------------------------------------------------- teardown
 function Graphics:Destroy()
 	Character:Destroy()
 	Custom:Destroy()
 	World:Reset()
+	Weather:Clear()
+	Overlay:Destroy()
+	CameraMod:Destroy()
 	for _, group in pairs(self.Features) do
 		for _, f in pairs(group) do
 			f:Disable()
@@ -2549,6 +3213,14 @@ function Graphics:BuildTabs(Library, Window)
 		{ "meshes", "Low mesh detail" },
 		{ "decor", "Hide terrain decoration" },
 		{ "quality", "Lowest graphics quality" },
+		{ "lights", "Disable point / spot lights" },
+		{ "envmap", "Disable environment reflections" },
+		{ "reflect", "Remove part reflections" },
+		{ "skyfx", "Disable atmosphere & clouds" },
+		{ "gui3d", "Disable billboard / surface GUIs" },
+		{ "highlights", "Disable highlights" },
+		{ "otheracc", "Hide other players' accessories" },
+		{ "cull", "Distance culling" },
 	}
 	local textureToggles = {
 		{ "decals", "Decals & textures" },
@@ -2572,16 +3244,34 @@ function Graphics:BuildTabs(Library, Window)
 
 	local presets = {
 		["Off"] = {},
-		["Light"] = { fps_shadows = true, fps_particles = true },
+		["Light"] = { fps_shadows = true, fps_particles = true, fps_postfx = true },
 		["Balanced"] = {
-			fps_shadows = true, fps_particles = true, fps_water = true,
-			fps_decor = true, fps_meshes = true, tex_flat = true,
+			fps_shadows = true, fps_particles = true, fps_postfx = true, fps_water = true,
+			fps_decor = true, fps_meshes = true, fps_lights = true, fps_skyfx = true,
+			fps_reflect = true, fps_highlights = true, tex_flat = true,
 		},
 		["Extreme"] = {
 			fps_shadows = true, fps_particles = true, fps_postfx = true, fps_water = true,
-			fps_meshes = true, fps_decor = true, fps_quality = true,
+			fps_meshes = true, fps_decor = true, fps_quality = true, fps_lights = true,
+			fps_envmap = true, fps_reflect = true, fps_skyfx = true, fps_gui3d = true,
+			fps_highlights = true, fps_otheracc = true,
 			tex_decals = true, tex_surface = true, tex_meshtex = true, tex_clothing = true, tex_flat = true,
 		},
+		["Potato (200+ FPS)"] = {
+			fps_shadows = true, fps_particles = true, fps_postfx = true, fps_water = true,
+			fps_meshes = true, fps_decor = true, fps_quality = true, fps_lights = true,
+			fps_envmap = true, fps_reflect = true, fps_skyfx = true, fps_gui3d = true,
+			fps_highlights = true, fps_otheracc = true, fps_cull = true,
+			tex_decals = true, tex_surface = true, tex_meshtex = true, tex_clothing = true, tex_flat = true,
+		},
+	}
+
+	-- order the auto booster switches things on, cheapest-looking / biggest-win first
+	local autoLevels = {
+		"fps_shadows", "fps_particles", "fps_postfx", "fps_lights", "fps_skyfx", "fps_water",
+		"fps_decor", "fps_reflect", "fps_meshes", "fps_envmap", "fps_highlights", "tex_flat",
+		"fps_gui3d", "fps_quality", "tex_decals", "tex_surface", "tex_meshtex", "tex_clothing",
+		"fps_otheracc", "fps_cull",
 	}
 
 	---------------------------------------------------------------- FPS tab
@@ -2589,7 +3279,8 @@ function Graphics:BuildTabs(Library, Window)
 	local g = fps:AddGroup("FPS Booster", "Left")
 	g:AddDropdown("fps_preset", {
 		Text = "Preset",
-		Values = { "Off", "Light", "Balanced", "Extreme" },
+		NoConfig = true, -- an action, not state: configs set the individual toggles instead
+		Values = { "Off", "Light", "Balanced", "Extreme", "Potato (200+ FPS)" },
 		Default = 1,
 		Callback = function(v)
 			setFlags(presets[v])
@@ -2604,29 +3295,99 @@ function Graphics:BuildTabs(Library, Window)
 			end,
 		})
 	end
+	g:AddSlider("fps_cull_dist", {
+		Text = "Culling distance", Min = 50, Max = 1500, Default = 300, Increment = 10, Suffix = " studs",
+		Callback = function(v)
+			self_.CullDistance = v
+		end,
+	})
+
+	---------------- FPS cap + auto booster
+	local cap = fps:AddGroup("FPS cap & auto boost", "Right")
+	local capValues = { "Game default", "60", "144", "165", "200", "240", "360", "Unlimited" }
+	self_.Cap = nil
+	cap:AddDropdown("fps_cap", {
+		Text = "FPS cap (needs executor setfpscap)",
+		Values = capValues,
+		Default = 1,
+		Callback = function(v)
+			if v == "Game default" then
+				self_.Cap = nil
+				return
+			end
+			local n = (v == "Unlimited") and 1000 or tonumber(v)
+			self_.Cap = n
+			local fn = (getgenv and getgenv().setfpscap) or setfpscap
+			if type(fn) == "function" then
+				pcall(fn, n)
+			elseif Library.Flags["fps_cap_warned"] ~= true then
+				Library.Flags["fps_cap_warned"] = true
+				Library:Notify("Your executor has no setfpscap - Roblox keeps its own cap", 4)
+			end
+		end,
+	})
+	local autoOn, autoIdx, autoWait, autoEnabled = false, 0, 0, {}
+	cap:AddToggle("fps_auto", {
+		Text = "Auto booster (reaches target FPS)",
+		Callback = function(v)
+			autoOn = v
+			if not v then
+				for _, flag in ipairs(autoEnabled) do
+					if O[flag] then
+						O[flag]:Set(false)
+					end
+				end
+				autoEnabled, autoIdx, autoWait = {}, 0, 0
+			end
+		end,
+	})
+	cap:AddSlider("fps_target", {
+		Text = "Target FPS", Min = 60, Max = 360, Default = 200, Increment = 10,
+	})
+	Library:OnStats(function(cur)
+		if not autoOn then
+			return
+		end
+		if autoWait > 0 then
+			autoWait -= 1 -- let the frame rate settle after each change
+			return
+		end
+		local target = Library.Flags["fps_target"] or 200
+		if self_.Cap then
+			target = math.min(target, self_.Cap * 0.95) -- never chase a number the cap makes impossible
+		end
+		if cur < target and autoIdx < #autoLevels then
+			autoIdx += 1
+			local flag = autoLevels[autoIdx]
+			local o = O[flag]
+			if o and not o.Value then
+				o:Set(true)
+				autoEnabled[#autoEnabled + 1] = flag
+				Library:Notify(string.format("Auto boost: %s (%d fps)", o.Text or flag, cur), 2)
+			end
+			autoWait = 4
+		end
+	end)
 
 	local stats = fps:AddGroup("Live stats", "Right")
 	local fpsLabel = stats:AddLabel("FPS: ...")
 	local frameLabel = stats:AddLabel("Frame time: ...")
 	local memLabel = stats:AddLabel("Memory: ...")
-	local acc, frames = 0, 0
-	self._statsConn = RunService.RenderStepped:Connect(function(dt)
-		acc += dt
-		frames += 1
-		if acc >= 0.5 then
-			local f = frames / acc
-			fpsLabel:SetText(string.format("FPS: %d", math.floor(f + 0.5)))
-			frameLabel:SetText(string.format("Frame time: %.1f ms", 1000 / f))
-			local ok, mem = pcall(function()
-				return Stats:GetTotalMemoryUsageMb()
-			end)
-			memLabel:SetText(ok and string.format("Memory: %d MB", mem) or "Memory: n/a")
-			acc, frames = 0, 0
+	Library:OnStats(function(f, ms)
+		if not Library.MenuVisible then
+			return -- no UI work while the menu is closed
 		end
+		fpsLabel:SetText(string.format("FPS: %d", f))
+		frameLabel:SetText(string.format("Frame time: %.1f ms", ms))
+		local ok, mem = pcall(function()
+			return Stats:GetTotalMemoryUsageMb()
+		end)
+		memLabel:SetText(ok and string.format("Memory: %d MB", mem) or "Memory: n/a")
 	end)
 
 	local actions = fps:AddGroup("Quick actions", "Right")
 	actions:AddButton("Revert everything", function()
+		O["fps_auto"]:Set(false)
 		setFlags({})
 		O["fps_preset"]:Set("Off")
 		O["shader_preset"]:Set("Off (none)")
@@ -2723,6 +3484,7 @@ function Graphics:BuildTabs(Library, Window)
 	})
 	local cg = sk:AddGroup("Custom skybox", "Right")
 	cg:AddTextbox("sky_custom", {
+		NoConfig = true,
 		Text = "Asset IDs (bk,dn,ft,lf,rt,up)",
 		Placeholder = "123,456,... or one ID",
 	})
@@ -2749,9 +3511,15 @@ function Graphics:RevertVisuals()
 			end
 		end
 	end
+	if lib and lib.Options["weather_type"] then
+		lib.Options["weather_type"]:Set("Off")
+	end
 	Character:Destroy()
 	Custom:Destroy()
 	World:Reset()
+	Weather:Clear()
+	Overlay:Destroy()
+	CameraMod:Destroy()
 end
 
 function Graphics:BuildVisuals(Library, Window)
@@ -2822,6 +3590,7 @@ function Graphics:BuildVisuals(Library, Window)
 	local pg = vis:AddGroup("Character presets", "Left")
 	pg:AddDropdown("char_preset", {
 		Text = "Preset",
+		NoConfig = true,
 		Values = presetNames,
 		Default = 1,
 		Callback = function(v)
@@ -2908,6 +3677,12 @@ function Graphics:BuildVisuals(Library, Window)
 	end
 
 	local lg = world:AddGroup("Lighting", "Left")
+	toggle(lg, "world_fullbright", {
+		Text = "Fullbright",
+		Callback = function(v)
+			World:Fullbright(v)
+		end,
+	})
 	lslider(lg, "Brightness", "Brightness", 0, 10, 0.1)
 	lslider(lg, "ExposureCompensation", "Exposure", -3, 3, 0.05)
 	lslider(lg, "ShadowSoftness", "Shadow softness", 0, 1, 0.05)
@@ -2928,6 +3703,27 @@ function Graphics:BuildVisuals(Library, Window)
 	})
 	lslider(fg, "FogStart", "Fog start", 0, 1500, 10)
 	lcolor(fg, "FogColor", "Fog color")
+
+	local terrain = workspace.Terrain
+	local wg = world:AddGroup("Water", "Left")
+	local function wslider(prop, text, min, max, inc)
+		wg:AddSlider("water_" .. string.lower(prop), {
+			Text = text, Min = min, Max = max, Increment = inc, Default = terrain[prop],
+			Callback = function(v)
+				World:SetTerrain(prop, v)
+			end,
+		})
+	end
+	wslider("WaterTransparency", "Transparency", 0, 1, 0.05)
+	wslider("WaterReflectance", "Reflectance", 0, 1, 0.05)
+	wslider("WaterWaveSize", "Wave size", 0, 1, 0.05)
+	wslider("WaterWaveSpeed", "Wave speed", 0, 100, 1)
+	wg:AddColorPicker("water_watercolor", {
+		Text = "Water color", Default = terrain.WaterColor,
+		Callback = function(c)
+			World:SetTerrain("WaterColor", c)
+		end,
+	})
 
 	local sky0 = Lighting:FindFirstChildOfClass("Sky")
 	local sg = world:AddGroup("Sky", "Right")
@@ -3089,6 +3885,518 @@ function Graphics:BuildVisuals(Library, Window)
 		end
 	end)
 	qa:AddLabel("Stacks on top of Shaders presets.")
+
+	---------------------------------------------------------------- Extras tab (camera, weather, overlay)
+	local ex = Window:AddTab("Extras")
+
+	local cam = ex:AddGroup("Camera", "Left")
+	toggle(cam, "cam_fov_on", {
+		Text = "Custom field of view",
+		Callback = function(v)
+			CameraMod.FovOn = v
+			CameraMod:_update()
+		end,
+	})
+	cam:AddSlider("cam_fov", {
+		Text = "Field of view", Min = 40, Max = 120, Default = 90, Increment = 1,
+		Callback = function(v)
+			CameraMod.Fov = v
+		end,
+	})
+	toggle(cam, "cam_zoom_on", {
+		Text = "Hold-to-zoom",
+		Callback = function(v)
+			CameraMod.ZoomOn = v
+			if not v then
+				CameraMod.Zooming = false
+			end
+			CameraMod:_update()
+		end,
+	})
+	cam:AddSlider("cam_zoom_fov", {
+		Text = "Zoom field of view", Min = 10, Max = 60, Default = 30, Increment = 1,
+		Callback = function(v)
+			CameraMod.ZoomFov = v
+		end,
+	})
+	cam:AddKeybind("cam_zoom_key", {
+		Text = "Zoom key", Default = "C", Mode = "Hold",
+		Callback = function(state)
+			CameraMod.Zooming = state and CameraMod.ZoomOn
+		end,
+	})
+	toggle(cam, "cam_unlock", {
+		Text = "Unlock zoom distance",
+		Callback = function(v)
+			CameraMod:SetZoomDistance(v and (Library.Flags["cam_maxzoom"] or 400) or nil)
+		end,
+	})
+	cam:AddSlider("cam_maxzoom", {
+		Text = "Max zoom distance", Min = 20, Max = 2000, Default = 400, Increment = 10,
+		Callback = function(v)
+			if Library.Flags["cam_unlock"] then
+				CameraMod:SetZoomDistance(v)
+			end
+		end,
+	})
+
+	local wx = ex:AddGroup("Weather", "Right")
+	wx:AddDropdown("weather_type", {
+		Text = "Weather",
+		Values = Weather.Order,
+		Default = 1,
+		Callback = function(v)
+			Weather:Set("Type", v)
+		end,
+	})
+	wx:AddSlider("weather_intensity", {
+		Text = "Intensity", Min = 0.1, Max = 3, Default = 1, Increment = 0.1,
+		Callback = function(v)
+			Weather:Set("Intensity", v)
+		end,
+	})
+	wx:AddSlider("weather_wind", {
+		Text = "Wind", Min = -40, Max = 40, Default = 0, Increment = 1,
+		Callback = function(v)
+			Weather:Set("Wind", v)
+		end,
+	})
+	wx:AddToggle("weather_recolor", {
+		Text = "Custom particle color",
+		Color = C(255, 255, 255),
+		ColorCallback = function(c)
+			if Library.Flags["weather_recolor"] then
+				Weather:Set("Override", c)
+			end
+		end,
+		Callback = function(v)
+			local picker = O["weather_recolor_color"]
+			Weather:Set("Override", v and picker and picker.Value or nil)
+		end,
+	})
+	wx:AddLabel("Weather follows your camera.")
+
+	local ov = ex:AddGroup("Screen overlay", "Right")
+	toggle(ov, "ov_tint", {
+		Text = "Screen tint",
+		Color = Overlay.V.TintColor,
+		ColorCallback = function(c)
+			Overlay.V.TintColor = c
+			Overlay:Update()
+		end,
+		Callback = function(v)
+			Overlay.On.Tint = v
+			Overlay:Update()
+		end,
+	})
+	ov:AddSlider("ov_tint_alpha", {
+		Text = "Tint transparency", Min = 0.5, Max = 1, Default = 0.88, Increment = 0.01,
+		Callback = function(v)
+			Overlay.V.TintAlpha = v
+			Overlay:Update()
+		end,
+	})
+	toggle(ov, "ov_bars", {
+		Text = "Cinematic bars",
+		Callback = function(v)
+			Overlay.On.Bars = v
+			Overlay:Update()
+		end,
+	})
+	ov:AddSlider("ov_bars_size", {
+		Text = "Bar size", Min = 0.02, Max = 0.25, Default = 0.11, Increment = 0.01,
+		Callback = function(v)
+			Overlay.V.Bars = v
+			Overlay:Update()
+		end,
+	})
+end
+
+---------------------------------------------------------------- Configs tab
+-- Call this AFTER every other tab is built: it snapshots the default state of all options.
+function Graphics:BuildConfigs(Library, Window)
+	local O = Library.Options
+	local HttpService = game:GetService("HttpService")
+	local FOLDER = "logicsense"
+	local FREE = "[free] "
+
+	---------------------------------------------------------------- built-in free configs
+	local function on(...)
+		local t = {}
+		for _, k in ipairs({ ... }) do
+			t[k] = true
+		end
+		return t
+	end
+	local function merge(...)
+		local out = {}
+		for _, t in ipairs({ ... }) do
+			for k, v in pairs(t) do
+				out[k] = v
+			end
+		end
+		return out
+	end
+	local BOOST_ALL = on(
+		"fps_shadows", "fps_particles", "fps_postfx", "fps_water", "fps_meshes", "fps_decor", "fps_quality",
+		"fps_lights", "fps_envmap", "fps_reflect", "fps_skyfx", "fps_gui3d", "fps_highlights", "fps_otheracc",
+		"tex_decals", "tex_surface", "tex_meshtex", "tex_clothing", "tex_flat"
+	)
+	local BOOST_BAL = on(
+		"fps_shadows", "fps_particles", "fps_postfx", "fps_water", "fps_decor", "fps_meshes",
+		"fps_lights", "fps_skyfx", "fps_reflect", "fps_highlights", "tex_flat"
+	)
+	local UNCAP = { fps_cap = "Unlimited" }
+
+	local BUILTIN = {
+		{
+			name = "FPS Max (200+)",
+			desc = "Everything heavy off + culling. Ugly but fastest.",
+			data = merge(BOOST_ALL, UNCAP, on("fps_cull"), { fps_cull_dist = 450 }),
+		},
+		{
+			name = "FPS Balanced",
+			desc = "Big FPS gain, game still looks fine.",
+			data = merge(BOOST_BAL, UNCAP, { shader_preset = "Low Quality" }),
+		},
+		{
+			name = "Auto 200 FPS",
+			desc = "Auto booster keeps turning things off until 200 FPS.",
+			data = merge(UNCAP, { fps_auto = true, fps_target = 200 }),
+		},
+		{
+			name = "Competitive Clean",
+			desc = "Clear image, no clutter, light color boost.",
+			data = merge(
+				on("fps_shadows", "fps_particles", "fps_postfx", "fps_decor", "fps_water", "fps_skyfx", "fps_highlights"),
+				UNCAP,
+				{ shader_preset = "Bright & Clean", shader_strength = 60 }
+			),
+		},
+		{
+			name = "Cinematic Film",
+			desc = "Golden hour, film grade, letterbox bars, vignette.",
+			data = merge(on("ov_bars", "fx_vignette"), {
+				shader_preset = "Cinematic", sky_preset = "Golden Hour", ov_bars_size = 0.11, fx_vignette_strength = 0.5,
+			}),
+		},
+		{
+			name = "Cyberpunk Night",
+			desc = "Neon city sky, rain, glowing cyan character.",
+			data = merge(on("char_enabled", "char_trail", "char_glow", "char_outline", "fx_vignette"), {
+				shader_preset = "Cyberpunk", sky_preset = "Neon City", weather_type = "Rain",
+				char_material = "Neon", char_color = C(0, 240, 255), char_trail_color = C(255, 60, 210),
+				char_glow_color = C(0, 240, 255), char_outline_color = C(255, 60, 210), fx_vignette_strength = 0.55,
+			}),
+		},
+		{
+			name = "Horror Night",
+			desc = "Blood moon, heavy fog, falling ash, dark vignette.",
+			data = merge(on("fx_vignette"), {
+				shader_preset = "Horror", sky_preset = "Blood Moon", weather_type = "Ash", weather_intensity = 1.5,
+				world_fogend = 260, fx_vignette_strength = 0.8,
+			}),
+		},
+		{
+			name = "Dreamy Sakura",
+			desc = "Pink sky, falling petals, soft glow.",
+			data = merge(on("char_enabled", "char_aura"), {
+				shader_preset = "Dreamy", sky_preset = "Sakura", weather_type = "Sakura Petals",
+				char_material = "Neon", char_color = C(255, 120, 190), char_aura_color = C(255, 170, 215),
+			}),
+		},
+		{
+			name = "Winter Snowfall",
+			desc = "Cold grade, overcast sky, snow, icy character.",
+			data = {
+				shader_preset = "Arctic", sky_preset = "Snowfall", weather_type = "Snow", weather_intensity = 1.3,
+				char_enabled = true, char_material = "Ice", char_color = C(160, 220, 255), char_reflectance = 0.2,
+			},
+		},
+		{
+			name = "Realistic Day",
+			desc = "Natural color, clear sky, subtle vignette.",
+			data = merge(on("fx_vignette"), {
+				shader_preset = "Realistic", sky_preset = "Clear Noon", fx_vignette_strength = 0.3,
+			}),
+		},
+		{
+			name = "Rainbow Gamer",
+			desc = "Rainbow neon character with trail, aura, glow.",
+			data = merge(on("char_enabled", "char_rainbow", "char_outline", "char_trail", "char_aura", "char_glow"), {
+				shader_preset = "Vibrant", sky_preset = "Neon City", char_material = "Neon", char_rainbow_speed = 0.6,
+			}),
+		},
+		{
+			name = "Space Explorer",
+			desc = "Cosmic sky, drifting stars, hologram character.",
+			data = merge(on("char_enabled", "char_glow"), {
+				shader_preset = "High Quality", sky_preset = "Cosmic Dust", weather_type = "Stars",
+				char_material = "ForceField", char_color = C(0, 200, 255), char_glow_color = C(0, 200, 255),
+			}),
+		},
+		{
+			name = "Desert Heat",
+			desc = "Hot sky, haze and a light sandstorm.",
+			data = { shader_preset = "Desert Heat", sky_preset = "Desert Noon", weather_type = "Sandstorm", weather_intensity = 0.6 },
+		},
+		{
+			name = "Lava World",
+			desc = "Red sky, drifting embers, molten character.",
+			data = merge(on("char_enabled", "char_glow"), {
+				shader_preset = "Cinematic", sky_preset = "Lava World", weather_type = "Embers",
+				char_material = "Neon", char_color = C(255, 80, 0), char_glow_color = C(255, 110, 20),
+			}),
+		},
+		{
+			name = "Default (everything off)",
+			desc = "Resets every option to how the menu started.",
+			data = {},
+		},
+	}
+
+	---------------------------------------------------------------- baseline snapshot (menu defaults)
+	local baseline = {}
+	for flag, opt in pairs(O) do
+		local v = opt.Value
+		-- sky_time is left out: picking a skybox moves it, and the reset must not undo that
+		if not opt.NoConfig and v ~= nil and type(v) ~= "table" and flag ~= "sky_time" then
+			baseline[flag] = v
+		end
+	end
+
+	local function applyFree(b)
+		Library:ApplyConfig(merge(baseline, b.data), false)
+	end
+
+	---------------------------------------------------------------- executor file system (optional)
+	local function fsOK()
+		return type(writefile) == "function" and type(readfile) == "function" and type(isfolder) == "function"
+			and type(makefolder) == "function" and type(listfiles) == "function"
+	end
+	local mem = {} -- name -> json (used when there is no file system, and as a cache)
+	local function path(name)
+		return FOLDER .. "/" .. name .. ".json"
+	end
+	local function clean(name)
+		name = tostring(name or ""):gsub("[^%w _%-]", ""):gsub("^%s+", ""):gsub("%s+$", "")
+		return name
+	end
+	local function savedNames()
+		local set = {}
+		for n in pairs(mem) do
+			set[n] = true
+		end
+		if fsOK() then
+			pcall(function()
+				if not isfolder(FOLDER) then
+					makefolder(FOLDER)
+				end
+				for _, p in ipairs(listfiles(FOLDER)) do
+					local n = string.match(p, "([^/\\]+)%.json$")
+					if n then
+						set[n] = true
+					end
+				end
+			end)
+		end
+		local out = {}
+		for n in pairs(set) do
+			out[#out + 1] = n
+		end
+		table.sort(out)
+		return out
+	end
+	local function readSaved(name)
+		if mem[name] then
+			return mem[name]
+		end
+		if fsOK() then
+			local ok, res = pcall(function()
+				return readfile(path(name))
+			end)
+			if ok then
+				return res
+			end
+		end
+	end
+	local function writeSaved(name, json)
+		mem[name] = json
+		if fsOK() then
+			pcall(function()
+				if not isfolder(FOLDER) then
+					makefolder(FOLDER)
+				end
+				writefile(path(name), json)
+			end)
+		end
+	end
+
+	---------------------------------------------------------------- UI
+	local tab = Window:AddTab("Configs")
+	local lg = tab:AddGroup("Configs", "Left")
+	local desc
+
+	local function values()
+		local v = {}
+		for _, b in ipairs(BUILTIN) do
+			v[#v + 1] = FREE .. b.name
+		end
+		for _, n in ipairs(savedNames()) do
+			v[#v + 1] = n
+		end
+		return v
+	end
+	local function builtinFor(sel)
+		if string.sub(sel or "", 1, #FREE) == FREE then
+			local n = string.sub(sel, #FREE + 1)
+			for _, b in ipairs(BUILTIN) do
+				if b.name == n then
+					return b
+				end
+			end
+		end
+	end
+
+	local list = lg:AddDropdown("cfg_list", {
+		Text = "Config",
+		NoConfig = true,
+		Values = values(),
+		Default = 1,
+		Callback = function(sel)
+			local b = builtinFor(sel)
+			if desc then
+				desc:SetText(b and b.desc or "Saved config.")
+			end
+		end,
+	})
+	desc = lg:AddLabel(BUILTIN[1].desc)
+
+	lg:AddButton("Load selected", function()
+		local sel = list.Value
+		local b = builtinFor(sel)
+		if b then
+			applyFree(b)
+			Library:Notify("Loaded config: " .. b.name, 3)
+			return
+		end
+		local json = readSaved(sel)
+		if json and Library:ImportConfig(json) then
+			Library:Notify("Loaded config: " .. tostring(sel), 3)
+		else
+			Library:Notify("Could not load that config", 3)
+		end
+	end)
+	lg:AddButton("Overwrite selected (saved only)", function()
+		local sel = list.Value
+		if builtinFor(sel) then
+			Library:Notify("Free configs are read-only - use 'Save as new'", 3)
+			return
+		end
+		writeSaved(sel, Library:ExportConfig())
+		Library:Notify("Saved: " .. tostring(sel), 3)
+	end)
+	lg:AddButton("Delete selected (saved only)", function()
+		local sel = list.Value
+		if builtinFor(sel) then
+			Library:Notify("Free configs can't be deleted", 3)
+			return
+		end
+		mem[sel] = nil
+		if fsOK() and type(delfile) == "function" then
+			pcall(delfile, path(sel))
+		end
+		list:SetValues(values())
+		list:Set(list.Values[1])
+		Library:Notify("Deleted: " .. tostring(sel), 3)
+	end)
+	lg:AddButton("Refresh list", function()
+		list:SetValues(values())
+	end)
+
+	local sg = tab:AddGroup("Save current settings", "Left")
+	local nameBox = sg:AddTextbox("cfg_name", { Text = "Config name", Placeholder = "my config", NoConfig = true })
+	sg:AddButton("Save as new", function()
+		local name = clean(nameBox.Value)
+		if name == "" then
+			Library:Notify("Type a config name first", 3)
+			return
+		end
+		writeSaved(name, Library:ExportConfig())
+		list:SetValues(values())
+		list:Set(name)
+		Library:Notify("Saved config: " .. name, 3)
+	end)
+	sg:AddLabel(fsOK() and "Saved to your executor's workspace folder." or "No file access: configs last until you leave.")
+
+	local rg = tab:AddGroup("Share & reset", "Right")
+	local jsonBox = rg:AddTextbox("cfg_json", { Text = "Config JSON", Placeholder = "paste a config here", NoConfig = true })
+	rg:AddButton("Export current (copy)", function()
+		local json = Library:ExportConfig()
+		jsonBox:Set(json)
+		local clip = setclipboard or toclipboard
+		if type(clip) == "function" and pcall(clip, json) then
+			Library:Notify("Config copied to clipboard", 3)
+		else
+			Library:Notify("Config placed in the box above", 3)
+		end
+	end)
+	rg:AddButton("Import from box", function()
+		if Library:ImportConfig(jsonBox.Value) then
+			Library:Notify("Config imported", 3)
+		else
+			Library:Notify("That isn't a valid config", 3)
+		end
+	end)
+	rg:AddButton("Reset everything to default", function()
+		Library:ApplyConfig(baseline, false)
+		Library:Notify("Reset to defaults", 3)
+	end)
+
+	local ag = tab:AddGroup("Autoload", "Right")
+	local AUTO = FOLDER .. "/autoload.txt"
+	ag:AddButton("Autoload selected config", function()
+		if not fsOK() then
+			Library:Notify("Autoload needs file access (executor)", 3)
+			return
+		end
+		pcall(function()
+			if not isfolder(FOLDER) then
+				makefolder(FOLDER)
+			end
+			writefile(AUTO, list.Value)
+		end)
+		Library:Notify("Autoload: " .. tostring(list.Value), 3)
+	end)
+	ag:AddButton("Clear autoload", function()
+		if fsOK() and type(delfile) == "function" then
+			pcall(delfile, AUTO)
+		end
+		Library:Notify("Autoload cleared", 3)
+	end)
+	ag:AddLabel("Autoload runs when the script starts.")
+
+	-- run the autoload config (if any) once the UI is ready
+	task.defer(function()
+		if not fsOK() or type(isfile) ~= "function" then
+			return
+		end
+		local ok, sel = pcall(function()
+			return isfile(AUTO) and readfile(AUTO) or nil
+		end)
+		if ok and sel and sel ~= "" then
+			local b = builtinFor(sel)
+			if b then
+				applyFree(b)
+			else
+				local json = readSaved(sel)
+				if json then
+					Library:ImportConfig(json)
+				end
+			end
+			Library:Notify("Autoloaded config: " .. sel, 3)
+		end
+	end)
 end
 
 return Graphics
@@ -3103,7 +4411,7 @@ local Graphics = __require("Graphics")
 
 local Window = Library:CreateWindow({
 	Title = "logicsense",
-	Size = Vector2.new(660, 460),
+	Size = Vector2.new(700, 500),
 	ToggleKey = Enum.KeyCode.RightShift,
 })
 
@@ -3127,18 +4435,34 @@ Graphics:BuildVisuals(Library, Window)
 -- 	CC = { Contrast = 0.15, Saturation = 0.3 },
 -- })
 
+-- Configs tab (free configs, save / load / import / export / autoload). Must come after all other tabs.
+Graphics:BuildConfigs(Library, Window)
+
 local Settings = Window:AddTab("Settings")
 local Menu = Settings:AddGroup("Menu", "Left")
 Menu:AddToggle("watermark", {
-	Text = "Watermark", Default = true,
+	Text = "Watermark", Default = true, NoConfig = true,
 	Callback = function(on)
 		Library:SetWatermark(on and "logicsense" or nil)
 	end,
 })
+Menu:AddToggle("keylist", {
+	Text = "Keybind list", Default = false, NoConfig = true,
+	Callback = function(on)
+		Library:SetKeybindList(on)
+	end,
+})
+Menu:AddLabel("Menu key: RightShift")
 Menu:AddButton("Unload", function()
 	Graphics:Destroy() -- reverts every graphics change
 	Library:Unload()
 end)
+
+local Info = Settings:AddGroup("About", "Right")
+Info:AddLabel("logicsense - client-side visuals")
+Info:AddLabel("Only changes what YOU see.")
+Info:AddLabel("FPS depends on your PC: the booster")
+Info:AddLabel("removes work, it can't add GPU power.")
 
 Library:SetWatermark("logicsense")
 Library:Notify("Loaded - press RightShift to toggle the menu", 4)
